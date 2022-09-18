@@ -23,6 +23,12 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
+"""
+batch_size:即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
+length：即每个句子有多少个单词。
+d_model：嵌入维度，一般设为512维。
+"""
+
 # Set to False to skip notebook execution (e.g. for debugging)
 warnings.filterwarnings("ignore") # 设置忽略警告
 RUN_EXAMPLES = True
@@ -227,10 +233,10 @@ class DecoderLayer(nn.Module):
         # sublayer[2]指feed forward层
         return self.sublayer[2](x, self.feed_forward)
     
-# 如encoder不注意非句子的pad部分。decoder不注意后面的词，也不注意pad部分  
+# encoder不注意非句子的pad部分。decoder不注意后面的词，同时也不注意pad部分  
 def subsequent_mask(size):
     "Mask out subsequent positions."
-    # 生成一个大小为1 x size x size的的矩阵，该方法在训练中构建tgt_mask时使用。
+    # 生成一个大小为1 x size x size的的矩阵，该方法在训练中构建tgt_mask时，即遮盖住翻译的正确答案时使用。
     # 前面加1是为了和tgt的tensor维度保持一致，因为tgt第一维时batch_size
     attn_shape = (1, size, size) 
     # 
@@ -245,7 +251,7 @@ def subsequent_mask(size):
     subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1).type(
         torch.uint8
     )
-    return subsequent_mask == 0 # 将0变为1，将1变为0，即0为需要mask的内容
+    return subsequent_mask == 0 # 然后将0变为1，将1变为0，其中0为需要mask掉的内容
 
 # 拆成多头之后的计算
 def attention(query, key, value, mask=None, dropout=None):
@@ -344,7 +350,6 @@ class Embeddings(nn.Module):
     def forward(self, x):
         return self.lut(x) * math.sqrt(self.d_model)
 
-"""       位置编码
 class PositionalEncoding(nn.Module):
     "Implement the PE function."
 
@@ -353,20 +358,32 @@ class PositionalEncoding(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
         # Compute the positional encodings once in log space.
+        # 初始化Shape为(max_len, d_model)的PE (positional encoding)
         pe = torch.zeros(max_len, d_model)
+        # 初始化一个tensor [[0, 1, 2, 3, ...]]
         position = torch.arange(0, max_len).unsqueeze(1)
+        # 这里就是sin和cos括号中的内容，通过e和ln进行了变换
         div_term = torch.exp(
             torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model)
         )
+        # 计算PE(pos, 2i)
         pe[:, 0::2] = torch.sin(position * div_term)
+        # 计算PE(pos, 2i+1)
         pe[:, 1::2] = torch.cos(position * div_term)
+        # 为了方便计算，在最外面在unsqueeze出一个batch
         pe = pe.unsqueeze(0)
+        # 如果一个参数不参与梯度下降，但又希望保存model的时候将其保存下来
+        # 这个时候就可以用register_buffer
         self.register_buffer("pe", pe)
 
     def forward(self, x):
+        """
+        x为embedding后的inputs,例如(1,7,512),batch size为1,7个单词,单词维度为512
+        """
+        # 将x和positional encoding相加。
         x = x + self.pe[:, : x.size(1)].requires_grad_(False)
         return self.dropout(x)
-""" 
+
     
 def make_model(
     src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1
@@ -377,15 +394,15 @@ def make_model(
     attn = MultiHeadedAttention(h, d_model)
     # 2、构建feed forward网络
     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-    # position = PositionalEncoding(d_model, dropout)   
+    position = PositionalEncoding(d_model, dropout)   
     # 3、构建transformer模型
     model = EncoderDecoder(
         Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
         Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
-        # nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
-        # nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
-        Embeddings(d_model, src_vocab), # inputs的编码器
-        Embeddings(d_model, tgt_vocab), # outputs的编码器
+        nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
+        nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
+        # Embeddings(d_model, src_vocab), # inputs的编码器
+        # Embeddings(d_model, tgt_vocab), # outputs的编码器
         Generator(d_model, tgt_vocab), # 用于预测下一个token
     )
 
@@ -398,13 +415,13 @@ def make_model(
     return model
 
 """
-# 推理(inference) 在训练之前测试模型，没有给出损失函数，因此输出是随机的
+# 推理(inference) 在训练之前用来测试模型，没有给出损失函数，因此输出是随机的
     # 原词典和目标词典大小都为11，encoderlayer和decoderlayer都是2层
     test_model = make_model(11, 11, 2)
     test_model.eval()
     # 定义inputs，shape为[1, 10]，即一个句子，每个句子10个单词
     src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
-    # 定义src_mask，即所有的单词都是有效的，没有填充值
+    # 定义src_mask，即所有的单词为1，都是有效的，没有pad
     src_mask = torch.ones(1, 1, 10)
 
     # inputs经ecoder之后，得到memory
@@ -420,7 +437,7 @@ def make_model(
         out = test_model.decode(
             memory, src_mask, ys, subsequent_mask(ys.size(1)).type_as(src.data) 
         )
-        # out维度变化的是[batch_size, 词数，词向量]中词数这个维度，每次取最后一个词
+        # out维度变化的是[batch_size, 词数，词向量]中词数这个维度（decoder一个一个输出词），因此每次只取最后一个词
         prob = test_model.generator(out[:, -1])
         # _即最大值，next_word即最大值对应的索引
         _, next_word = torch.max(prob, dim=1)
@@ -450,10 +467,10 @@ class Batch:
         self.src = src
         self.src_mask = (src != pad).unsqueeze(-2) # 将src中pad部分mask掉，然后将维度与scores保持一致
         if tgt is not None:
-            self.tgt = tgt[:, :-1] # 去掉最后一个词，tgt存储的是decoder的输入，所以不会出现最后一个词
-            self.tgt_y = tgt[:, 1:] # 去掉第一个词'<bos>'
+            self.tgt = tgt[:, :-1] # 去掉最后一个词，tgt存储的是decoder的输入，所以不会出现最后一个词，即`<bos> 我 爱 你`（没有'<eos>'）
+            self.tgt_y = tgt[:, 1:] # tgt_y存储希望预测的结果，去掉第一个词'<bos>'，即“我 爱 你 <eos>”
             self.tgt_mask = self.make_std_mask(self.tgt, pad)
-            self.ntokens = (self.tgt_y != pad).data.sum() # 该batch的tgt_y的总token的数量，去除'pad'部分的词数，同时前面也去掉了'bos'
+            self.ntokens = (self.tgt_y != pad).data.sum() # 该batch的tgt_y的总token的数量，去除'pad'部分的词数，同时前面也去掉了'<bos>'
 
     @staticmethod
     def make_std_mask(tgt, pad): # 生成tgt_mask
@@ -554,11 +571,13 @@ def rate(step, model_size, factor, warmup):
     """
     if step == 0:   # 避免分母为0
         step = 1
+    # 学习率的计算公式，具体见https://blog.csdn.net/zhaohongfei_358/article/details/126085557
     return factor * (
         model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5))
     )
     
-# 标签平滑 + 计算损失
+# 标签平滑（正则化，防止过拟合） + 计算损失
+# 在训练时即假设标签可能存在错误，避免“过分”相信训练样本的标签。当目标函数为交叉熵时，称为标签平滑（Label Smoothing）。平滑指的是把两个极端值0和1变成两个不那么极端的值，如[0,0,0,1,0]平滑后的label为[0.05,0.05,0.05,0.8,0.05]
 class LabelSmoothing(nn.Module):
     "Implement label smoothing."
     
@@ -592,10 +611,11 @@ class LabelSmoothing(nn.Module):
         self.true_dist = true_dist # 保存平滑后的标签
         return self.criterion(x, true_dist.clone().detach()) # 使用平滑后的标签计算损失，由于对`<blank>`部分进行了mask，所以在这部分不参与损失计算
 
-# copy任务，造数据    
-def data_gen(V, batch_size, nbatches):
+# 造数据    
+def data_gen(V, batch_size, nbatches): 
+    # V：随机生成数字的最大值+1，batch_size是每次输入到模型更新一次参数的数据量，一共输入nbatch个batch完成一轮epoch
     "Generate random data for a src-tgt copy task."
-    for i in range(nbatches): # 生成nbatch个Batch
+    for i in range(nbatches): # 遍历batch
         data = torch.randint(1, V, size=(batch_size, 10))
         data[:, 0] = 1 # 将每行的第一个词改为1，即"<bos>"
         src = data.requires_grad_(False).clone().detach() # 该数据不需要梯度下降
@@ -612,15 +632,16 @@ class SimpleLossCompute:
 
     def __call__(self, x, y, norm):
         """
-        x: EncoderDecoder的输出，也就是Decoder的输出
-        y: batch.tgt_y，要被预测的所有token，例如src为`<bos> I love you <eos>`，
-           则`tgt_y`则为`我 爱 你 <eos>`
+        x: Decoder的输出，还没有进入generator，x:[batch_size, 词数, d_model]
+        y: batch.tgt_y，要被预测的所有token，例如src为`<bos> I love you <eos>`，则`tgt_y`则为`我 爱 你 <eos>`，即去掉<bos>的目标句子
         norm: batch.ntokens, tgt_y中的有效token数。用于对loss进行正则化。
         """
-        x = self.generator(x) # 调用generator预测token。(EncoderDecoder的forward中并没有调用generator)
-        # 使用KL散度计算损失，然后除以norm对loss进行正则化(标签平滑)。
+        x = self.generator(x) # x为调用generator输出的概率分布(EncoderDecoder的forward中并没有调用generator)
+        # 使用KL散度计算损失，然后/norm对loss进行正则化，防止loss过大过小，取其平均数。
         sloss = (
             self.criterion(
+                # x:[batch_size, 目标词典大小]    y:[batch_size]
+                # generator一次性得到所有词在词典中的概率分布，y就是这些词的目标翻译句子
                 x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1)
             )
             / norm
@@ -632,14 +653,12 @@ class SimpleLossCompute:
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
     """
     进行模型推理，推理出所有预测结果。
-    :param model: Transformer模型，即EncoderDecoder类对象
-    :param src: Encoder的输入inputs，Shape为(batch_size, 词数)
-                例如：[[1, 2, 3, 4, 5, 6, 7, 8, 0, 0]]
-                即一个句子，该句子有10个词，分别为1,2,...,0
-    :param src_mask: src的掩码，掩盖住非句子成分。
-    :param max_len: 一个句子的最大长度。
-    :param start_symbol: '<bos>' 对应的index，在本例中始终为0
-    :return: 预测结果，例如[[1, 2, 3, 4, 5, 6, 7, 8]]
+    model: Transformer模型，即EncoderDecoder类对象
+    src: Encoder的输入inputs，Shape为(batch_size, 词数)。例如：[[1, 2, 3, 4, 5, 6, 7, 8, 0, 0]]，即一个句子，该句子有10个词，分别为1,2,...,0
+    src_mask: src的掩码，掩盖住非句子成分
+    max_len: 一个句子的最大长度
+    start_symbol: '<bos>' 对应的index，在本例中始终为0
+    return: 预测结果，例如[[1, 2, 3, 4, 5, 6, 7, 8]]
     """
     memory = model.encode(src, src_mask) # 将src送入模型的encoder
     # 初始化ys为[[0]]，用于保存预测结果，其中0表示'<bos>'
@@ -674,12 +693,12 @@ def example_simple_model():
     optimizer = torch.optim.Adam(
         model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
     )
-    # 自定义Warmup学习率
+    
+    #自定义Warmup学习率
     lr_scheduler = LambdaLR(
         optimizer=optimizer,
         lr_lambda=lambda step: rate(
-            # step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400
-            step, model_size=model.src_embed.d_model, factor=1.0, warmup=400
+            step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400
         ),
     )
 
@@ -713,7 +732,6 @@ def example_simple_model():
     # 不需要mask，因为这10个都是有意义的数字
     src_mask = torch.ones(1, 1, max_len)
     # 使用greedy_decode进行推理
-    print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0))
-
+    print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0)) # Loss:0.11     tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
 
 execute_example(example_simple_model)
