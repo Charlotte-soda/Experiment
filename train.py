@@ -8,6 +8,7 @@ import time
 import warnings  # 用于忽略警告日志
 from os.path import exists
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
@@ -42,7 +43,16 @@ V = batch_size * 3 +1
 
 
 # Some convenience helper functions used throughout the notebook
+def Quantization(SigmoidData):
+    # Quantization and De-quantization
+    N=4
+    stepsize=(1.0-(0))/(2**N)
+    #Encode
+    Migmoid_quant_rise_ind=torch.floor(SigmoidData/stepsize)
+    #Decode
+    Migmoid_quant_rise_ind=SigmoidData*stepsize+stepsize/2
 
+    return Migmoid_quant_rise_ind
 
 def is_interactive_notebook():
     return __name__ == "__main__"
@@ -81,9 +91,12 @@ class EncoderDecoder(nn.Module):
     other models.
     """
 
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator,d_model):
         super(EncoderDecoder, self).__init__()
         self.encoder = encoder
+        self.linear = nn.Linear(d_model, 64)
+        self.linear1 = nn.Linear(64,d_model)
+        self.sigmoid = nn.Sigmoid()
         self.decoder = decoder
         self.src_embed = src_embed
         self.tgt_embed = tgt_embed
@@ -91,7 +104,14 @@ class EncoderDecoder(nn.Module):
 
     def forward(self, src, tgt, src_mask, tgt_mask):
         "Take in and process masked src and target sequences."
-        return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
+        # return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
+        Subencoder = self.encode(src,src_mask)
+        Sublinear = self.linear(Subencoder)
+        Subsigmoid = self.sigmoid(Sublinear)
+        Subquan = Quantization(Subsigmoid)
+        Transcoder = self.linear1(Subquan)
+        # print("模型输出",Subquan,Subsigmoid)
+        return self.decode(Transcoder, src_mask, tgt, tgt_mask)
 
     def encode(self, src, src_mask):
         return self.encoder(self.src_embed(src), src_mask)
@@ -412,6 +432,7 @@ def make_model(
         # Embeddings(d_model, src_vocab), # inputs的编码器
         # Embeddings(d_model, tgt_vocab), # outputs的编码器
         Generator(d_model, tgt_vocab), # 用于预测下一个token
+        d_model
     )
 
     # This was important from their code.
@@ -714,7 +735,7 @@ def example_simple_model():
 
     # batch_size = 80
     # V = batch_size * 3 +1
-    for epoch in range(1): # 运行20个epoch
+    for epoch in range(20): # 运行20个epoch
         model.train() # 将模型调整为训练模式
         run_epoch(  # 训练一个Batch
             data_gen(V, batch_size, 20), # 生成20个batch对象
@@ -738,6 +759,7 @@ def example_simple_model():
     model.eval()
     # 定义src为0-9，看看模型能否重新输出0-9
     src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    # src = torch.LongTensor([[0, 22, 23]])
     # 句子的最大长度是10
     max_len = src.shape[1]
     # 不需要mask，因为这10个都是有意义的数字
