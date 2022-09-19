@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
+import random
 from lib2to3.pgen2.tokenize import tokenize
 from sre_parse import Tokenizer
-import torch 
+
 import numpy as np
-import random
+import torch
+
 
 # 固定随机数
 def setup_seed(seed):

@@ -1,27 +1,31 @@
-import os
-from os.path import exists
-import torch
-import torch.nn as nn
-from torch.nn.functional import log_softmax, pad
-import math
 import copy
+import math
+import os
+import sys
 import time
-from torch.optim.lr_scheduler import LambdaLR
-import pandas as pd
-# import altair as alt # 绘制可交互的统计图 
-import torchtext
-from torchtext.data.functional import to_map_style_dataset # 将iterable风格的dataset转为map风格的dataset
-from torch.utils.data import DataLoader
-from torchtext.vocab import build_vocab_from_iterator # 构建词典
-import torchtext.datasets as datasets # 用于加载Multi30k数据集
 # import spacy # 分词工具
 # import GPUtil # GPU工具类，用于显示GPU使用情况
-import warnings # 用于忽略警告日志
-from torch.utils.data.distributed import DistributedSampler
+import warnings  # 用于忽略警告日志
+from os.path import exists
+
+import pandas as pd
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn as nn
+# import altair as alt # 绘制可交互的统计图 
+import torchtext
+import torchtext.datasets as datasets  # 用于加载Multi30k数据集
+from torch.nn.functional import log_softmax, pad
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torchtext.data.functional import \
+    to_map_style_dataset  # 将iterable风格的dataset转为map风格的dataset
+from torchtext.vocab import build_vocab_from_iterator  # 构建词典
 
+from DataProcess.data import getData
 
 """
 batch_size:即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
@@ -32,6 +36,10 @@ d_model：嵌入维度，一般设为512维。
 # Set to False to skip notebook execution (e.g. for debugging)
 warnings.filterwarnings("ignore") # 设置忽略警告
 RUN_EXAMPLES = True
+
+batch_size = 80
+V = batch_size * 3 +1
+
 
 # Some convenience helper functions used throughout the notebook
 
@@ -617,6 +625,7 @@ def data_gen(V, batch_size, nbatches):
     "Generate random data for a src-tgt copy task."
     for i in range(nbatches): # 遍历batch
         data = torch.randint(1, V, size=(batch_size, 10))
+        # data = data = torch.randint(1, batch_size * 3 +1, size=(batch_size, 10))
         data[:, 0] = 1 # 将每行的第一个词改为1，即"<bos>"
         src = data.requires_grad_(False).clone().detach() # 该数据不需要梯度下降
         tgt = data.requires_grad_(False).clone().detach()
@@ -683,7 +692,8 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
 # 训练一个简单的copy任务
 def example_simple_model():
     # 定义词典大小
-    V = 11  
+    # V = 11  
+ 
     # 定义损失函数
     criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
     # 构建模型，src和tgt的词典大小都为2，Layer数量为2
@@ -702,8 +712,9 @@ def example_simple_model():
         ),
     )
 
-    batch_size = 80
-    for epoch in range(20): # 运行20个epoch
+    # batch_size = 80
+    # V = batch_size * 3 +1
+    for epoch in range(1): # 运行20个epoch
         model.train() # 将模型调整为训练模式
         run_epoch(  # 训练一个Batch
             data_gen(V, batch_size, 20), # 生成20个batch对象
@@ -733,5 +744,10 @@ def example_simple_model():
     src_mask = torch.ones(1, 1, max_len)
     # 使用greedy_decode进行推理
     print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0)) # Loss:0.11     tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    # 获取下标对应的值
+    IDIndex = greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0)
+    IDIndex = IDIndex.detach().numpy()
+    getData(IDIndex, batch_size)
+
 
 execute_example(example_simple_model)
