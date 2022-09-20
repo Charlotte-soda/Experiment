@@ -15,18 +15,20 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 # import altair as alt # 绘制可交互的统计图 
-import torchtext
-import torchtext.datasets as datasets  # 用于加载Multi30k数据集
+# import torchtext
+# import torchtext.datasets as datasets  # 用于加载Multi30k数据集
 from torch.nn.functional import log_softmax, pad
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchtext.data.functional import \
-    to_map_style_dataset  # 将iterable风格的dataset转为map风格的dataset
-from torchtext.vocab import build_vocab_from_iterator  # 构建词典
 
 from DataProcess.data import getData
+
+# from torchtext.data.functional import \
+#     to_map_style_dataset  # 将iterable风格的dataset转为map风格的dataset
+# from torchtext.vocab import build_vocab_from_iterator  # 构建词典
+
 
 """
 batch_size:即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
@@ -45,12 +47,12 @@ V = batch_size * 3 +1
 # Some convenience helper functions used throughout the notebook
 def Quantization(SigmoidData):
     # Quantization and De-quantization
-    N=4
-    stepsize=(1.0-(0))/(2**N)
+    N = 4
+    stepsize = (1.0-(0))/(2**N)
     #Encode
-    Migmoid_quant_rise_ind=torch.floor(SigmoidData/stepsize)
+    Migmoid_quant_rise_ind = torch.floor(SigmoidData/stepsize)
     #Decode
-    Migmoid_quant_rise_ind=SigmoidData*stepsize+stepsize/2
+    Migmoid_quant_rise_ind = Migmoid_quant_rise_ind*stepsize+stepsize/2
 
     return Migmoid_quant_rise_ind
 
@@ -94,8 +96,8 @@ class EncoderDecoder(nn.Module):
     def __init__(self, encoder, decoder, src_embed, tgt_embed, generator,d_model):
         super(EncoderDecoder, self).__init__()
         self.encoder = encoder
-        self.linear = nn.Linear(d_model, 64)
-        self.linear1 = nn.Linear(64,d_model)
+        self.linear = nn.Linear(d_model, 128)
+        self.linear1 = nn.Linear(128,d_model)
         self.sigmoid = nn.Sigmoid()
         self.decoder = decoder
         self.src_embed = src_embed
@@ -105,10 +107,19 @@ class EncoderDecoder(nn.Module):
     def forward(self, src, tgt, src_mask, tgt_mask):
         "Take in and process masked src and target sequences."
         # return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
+        # Subencoder = self.encode(src,src_mask)
+        # Sublinear = self.linear(Subencoder)
+        # Subsigmoid = self.sigmoid(Sublinear)
+        # Subquan = Quantization(Subsigmoid)
+        # Transcoder = self.linear1(Subquan)
+
+        # Subencoder = self.encode(src,src_mask)
+        # Transcoder = Quantization(Subencoder)
+
         Subencoder = self.encode(src,src_mask)
-        Sublinear = self.linear(Subencoder)
-        Subsigmoid = self.sigmoid(Sublinear)
-        Subquan = Quantization(Subsigmoid)
+        Subsigmoid = self.sigmoid(Subencoder)
+        Sublinear = self.linear(Subsigmoid)
+        Subquan = Quantization(Sublinear)
         Transcoder = self.linear1(Subquan)
         # print("模型输出",Subquan,Subsigmoid)
         return self.decode(Transcoder, src_mask, tgt, tgt_mask)
@@ -563,7 +574,7 @@ def run_epoch(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 n_accum += 1    # 记录本次epoch的参数更新次数
-                train_state.accum_step += 1 # 记录模型的参数更新次数
+                train_state.accum_step += 1 # 记录模型的参数更新次数Epoc
             scheduler.step()    # 更新学习率
 
         total_loss += loss  # 累计loss
@@ -735,10 +746,10 @@ def example_simple_model():
 
     # batch_size = 80
     # V = batch_size * 3 +1
-    for epoch in range(20): # 运行20个epoch
+    for epoch in range(30): # 运行20个epoch
         model.train() # 将模型调整为训练模式
         run_epoch(  # 训练一个Batch
-            data_gen(V, batch_size, 20), # 生成20个batch对象
+            data_gen(V, batch_size, 20), # 生成20个batch对象进行训练
             model,
             SimpleLossCompute(model.generator, criterion),
             optimizer,
@@ -747,7 +758,7 @@ def example_simple_model():
         )
         model.eval() # 进行一个epoch后进行模型验证
         run_epoch(
-            data_gen(V, batch_size, 5),
+            data_gen(V, batch_size, 5), # 生成5个对象进行验证
             model,
             SimpleLossCompute(model.generator, criterion),
             DummyOptimizer(), # 验证时不进行参数更新
@@ -758,7 +769,8 @@ def example_simple_model():
     # 将模型调整为测试模式，准备开始推理
     model.eval()
     # 定义src为0-9，看看模型能否重新输出0-9
-    src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    src = torch.LongTensor([[0, 2, 2, 3, 4, 5, 6, 7, 8, 9]])
+    # src = torch.LongTensor([[0, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
     # src = torch.LongTensor([[0, 22, 23]])
     # 句子的最大长度是10
     max_len = src.shape[1]

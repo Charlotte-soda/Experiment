@@ -27,14 +27,14 @@ def getData(DataIndex, batch_size):
     
  
     index = np.arange(2, batch_size * 3 - 1)
-    print("jkjl",DataIndex)
+    print("输出的下标",DataIndex)
 
     
 
     vocab = dict(zip(index, samples))
     vocab[0] = '<bos>'
     vocab[1] = '<eos>'
-    print("元数据",vocab)
+    print("字典",vocab)
 
     # 获取下标对应的数
     for index in DataIndex:
