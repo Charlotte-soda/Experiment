@@ -16,25 +16,23 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-# input = torch.distributions.exponential.Exponential(rate=1).sample([200000]).cuda()
+# input = torch.distributions.exponential.Exponential(rate=1).sample([200000])
 # input = np.random.exponential(scale=1,size=(10))
 # data = np.around(input, 2).astype(np.float32)  # 保留两位小数
 
-def getData(DataIndex, batch_size):
+def getData(DataIndex):
     setup_seed(20)
-    # samples = torch.distributions.exponential.Exponential(rate=1).sample([10]).cuda()
-    samples = torch.distributions.exponential.Exponential(rate=1).sample([batch_size * 3])
-    
- 
-    index = np.arange(2, batch_size * 3 - 1)
-    print("输出的下标",DataIndex)
+    # samples = torch.distributions.exponential.Exponential(rate=1).sample([10])
+    samples = torch.distributions.exponential.Exponential(rate=1).sample([1000])
+    # print(samples)
 
-    
+    index = np.arange(2, 1000 - 1)
+    # print("输出的下标",DataIndex)
 
     vocab = dict(zip(index, samples))
     vocab[0] = '<bos>'
     vocab[1] = '<eos>'
-    print("字典",vocab)
+    # print("字典",vocab)
 
     # 获取下标对应的数
     for index in DataIndex:

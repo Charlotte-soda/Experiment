@@ -3,8 +3,7 @@ import math
 import os
 import sys
 import time
-# import spacy # 分词工具
-# import GPUtil # GPU工具类，用于显示GPU使用情况
+from tkinter import image_names
 import warnings  # 用于忽略警告日志
 from os.path import exists
 
@@ -14,20 +13,14 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
-# import altair as alt # 绘制可交互的统计图 
-# import torchtext
-# import torchtext.datasets as datasets  # 用于加载Multi30k数据集
 from torch.nn.functional import log_softmax, pad
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter 
 
 from DataProcess.data import getData
-
-# from torchtext.data.functional import \
-#     to_map_style_dataset  # 将iterable风格的dataset转为map风格的dataset
-# from torchtext.vocab import build_vocab_from_iterator  # 构建词典
 
 
 """
@@ -40,21 +33,9 @@ d_model：嵌入维度，一般设为512维。
 warnings.filterwarnings("ignore") # 设置忽略警告
 RUN_EXAMPLES = True
 
+
 batch_size = 80
-V = batch_size * 3 +1
-
-
-# Some convenience helper functions used throughout the notebook
-def Quantization(SigmoidData):
-    # Quantization and De-quantization
-    N = 4
-    stepsize = (1.0-(0))/(2**N)
-    #Encode
-    Migmoid_quant_rise_ind = torch.floor(SigmoidData/stepsize)
-    #Decode
-    Migmoid_quant_rise_ind = Migmoid_quant_rise_ind*stepsize+stepsize/2
-
-    return Migmoid_quant_rise_ind
+V = 1001
 
 def is_interactive_notebook():
     return __name__ == "__main__"
@@ -85,50 +66,57 @@ class DummyOptimizer(torch.optim.Optimizer):
 class DummyScheduler:
     def step(self):
         None
+    
+# 量化器
+def Quantization(SigmoidData):
+    # Quantization and De-quantization
+    N = 4
+    stepsize = (1.0-(0))/(2**N)
+    # Encode
+    Migmoid_quant_rise_ind = torch.floor(SigmoidData / stepsize)
+    # Decode
+    Migmoid_quant_rise_ind = Migmoid_quant_rise_ind * stepsize + stepsize / 2
+    
+    return Migmoid_quant_rise_ind    
         
 # 标准的模型架构，返回值为decoder输出
 class EncoderDecoder(nn.Module):
     """
-    A standard Encoder-Decoder architecture. Base for this and many
-    other models.
+    A standard Encoder-Decoder architecture. Base for this and many other models.
     """
 
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator,d_model):
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator, d_model):
         super(EncoderDecoder, self).__init__()
-        self.encoder = encoder
-        self.linear = nn.Linear(d_model, 128)
-        self.linear1 = nn.Linear(128,d_model)
-        self.sigmoid = nn.Sigmoid()
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.generator = generator
+        # 原模型
+        self.encoder = encoder.cuda()
+        self.decoder = decoder.cuda()
+        self.src_embed = src_embed.cuda()
+        self.tgt_embed = tgt_embed.cuda()
+        self.generator = generator.cuda()
+
+        # 自定义部分
+        self.linear1 = nn.Linear(d_model, 510).cuda()
+        self.linear2 = nn.Linear(510,d_model).cuda()
+        self.sigmoid = nn.Sigmoid().cuda()
 
     def forward(self, src, tgt, src_mask, tgt_mask):
         "Take in and process masked src and target sequences."
         # return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
-        # Subencoder = self.encode(src,src_mask)
-        # Sublinear = self.linear(Subencoder)
-        # Subsigmoid = self.sigmoid(Sublinear)
-        # Subquan = Quantization(Subsigmoid)
-        # Transcoder = self.linear1(Subquan)
+        x = self.encode(src, src_mask).cuda()
+        
+        x = self.linear1(x) # 降维
+        x = self.sigmoid(x).cuda()
+        x = Quantization(x).cuda()
+        output = self.linear2(x)
 
-        # Subencoder = self.encode(src,src_mask)
-        # Transcoder = Quantization(Subencoder)
+        return self.decode(output, src_mask, tgt, tgt_mask).cuda()
 
-        Subencoder = self.encode(src,src_mask)
-        Subsigmoid = self.sigmoid(Subencoder)
-        Sublinear = self.linear(Subsigmoid)
-        Subquan = Quantization(Sublinear)
-        Transcoder = self.linear1(Subquan)
-        # print("模型输出",Subquan,Subsigmoid)
-        return self.decode(Transcoder, src_mask, tgt, tgt_mask)
 
     def encode(self, src, src_mask):
-        return self.encoder(self.src_embed(src), src_mask)
+        return self.encoder(self.src_embed(src), src_mask).cuda()
 
     def decode(self, memory, src_mask, tgt, tgt_mask):
-        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
+        return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask).cuda()
     
 # 将decoder结果输入到Linear + Softmax，预测下一个token
 class Generator(nn.Module):
@@ -139,7 +127,7 @@ class Generator(nn.Module):
         self.proj = nn.Linear(d_model, vocab)
 
     def forward(self, x):
-        return log_softmax(self.proj(x), dim=-1) # log_softmax都可换成softmax，加快运算速度，提高数据稳定性
+        return log_softmax(self.proj(x), dim=-1) # log_softmax替换softmax，加快运算速度，提高数据稳定性
 
 # Encoder和Decoder堆叠
 def clones(module, N):
@@ -156,8 +144,8 @@ class Encoder(nn.Module):
         layer：要堆叠的层，即EncoderLayer类
         N：堆叠多少次
         """
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm(layer.size)   # 对应 Add & Norm 中的 Norm 部分
+        self.layers = clones(layer, N).cuda()
+        self.norm = LayerNorm(layer.size).cuda()   # 对应 Add & Norm 中的 Norm 部分
 
     def forward(self, x, mask):
         "Pass the input (and mask) through each layer in turn."
@@ -214,10 +202,10 @@ class EncoderLayer(nn.Module):
 
     def __init__(self, size, self_attn, feed_forward, dropout): 
         super(EncoderLayer, self).__init__()
-        self.self_attn = self_attn
-        self.feed_forward = feed_forward
+        self.self_attn = self_attn.cuda()
+        self.feed_forward = feed_forward.cuda()
         # 克隆两个残差连接，分别给attention层和feed forward层使用
-        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.sublayer = clones(SublayerConnection(size, dropout), 2).cuda()
         self.size = size    # size即d_model
 
     def forward(self, x, mask):
@@ -225,15 +213,15 @@ class EncoderLayer(nn.Module):
         # sublayer[0]即attention层的计算
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
         # sublayer[1]即feed forward层的计算
-        return self.sublayer[1](x, self.feed_forward)
+        return self.sublayer[1](x, self.feed_forward).cuda()
     
 class Decoder(nn.Module):
     "Generic N layer decoder with masking."
 
     def __init__(self, layer, N):
         super(Decoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm(layer.size)
+        self.layers = clones(layer, N).cuda()
+        self.norm = LayerNorm(layer.size).cuda()
 
     def forward(self, x, memory, src_mask, tgt_mask):
         """
@@ -246,8 +234,8 @@ class Decoder(nn.Module):
         """
         
         for layer in self.layers:
-            x = layer(x, memory, src_mask, tgt_mask)
-        return self.norm(x)
+            x = layer(x, memory, src_mask, tgt_mask).cuda()
+        return self.norm(x).cuda()
 
 # 单个DecoderLayer的具体实现：attention层 + feed forward层 + cross-attention层
 class DecoderLayer(nn.Module):
@@ -256,9 +244,9 @@ class DecoderLayer(nn.Module):
     def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
         super(DecoderLayer, self).__init__()
         self.size = size    # size即d_model，词向量的维度
-        self.self_attn = self_attn
-        self.src_attn = src_attn
-        self.feed_forward = feed_forward
+        self.self_attn = self_attn.cuda()
+        self.src_attn = src_attn.cuda()
+        self.feed_forward = feed_forward.cuda()
         # 克隆三个残差连接，分别给masked attention层、cross-attention层和feed forward层使用
         self.sublayer = clones(SublayerConnection(size, dropout), 3)
 
@@ -266,11 +254,11 @@ class DecoderLayer(nn.Module):
         "Follow Figure 1 (right) for connections."
         m = memory
         # sublayer[0]指masked attention层
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask)).cuda()
         # sublayer[1]指cross-attention层，其中key和value是encoder的输出即memory
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask)).cuda()
         # sublayer[2]指feed forward层
-        return self.sublayer[2](x, self.feed_forward)
+        return self.sublayer[2](x, self.feed_forward).cuda()
     
 # encoder不注意非句子的pad部分。decoder不注意后面的词，同时也不注意pad部分  
 def subsequent_mask(size):
@@ -312,7 +300,7 @@ def attention(query, key, value, mask=None, dropout=None):
     """
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k) 
     if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)    # pad值为-1e9，softmax之后为0
+        scores = scores.masked_fill(mask.cuda() == 0, -1e9)   # pad值为-1e9，softmax之后为0
     p_attn = scores.softmax(dim=-1) # p_atten: shape: [batch, head数, 词数, 词数]
     if dropout is not None:
         p_attn = dropout(p_attn)
@@ -365,7 +353,7 @@ class MultiHeadedAttention(nn.Module):
         del key
         del value
         # 最终通过W^o矩阵再执行一次线性变换，得到最终结果
-        return self.linears[-1](x)
+        return self.linears[-1](x).cuda()
 
 class PositionwiseFeedForward(nn.Module):
     "Implements FFN equation."
@@ -377,7 +365,7 @@ class PositionwiseFeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.w_2(self.dropout(self.w_1(x).relu())) 
+        return self.w_2(self.dropout(self.w_1(x).relu())).cuda() 
 
 # 两个embedding层使用相同的权重    
 class Embeddings(nn.Module):
@@ -387,7 +375,7 @@ class Embeddings(nn.Module):
         self.d_model = d_model
 
     def forward(self, x):
-        return self.lut(x) * math.sqrt(self.d_model)
+        return self.lut(x.cuda()) * math.sqrt(self.d_model)
 
 class PositionalEncoding(nn.Module):
     "Implement the PE function."
@@ -430,21 +418,19 @@ def make_model(
     "Helper: Construct a model from hyperparameters."
     c = copy.deepcopy   # 将模型深拷贝一份，相当于new一个全新的模型
     # 1、构建多头注意力机制
-    attn = MultiHeadedAttention(h, d_model)
+    attn = MultiHeadedAttention(h, d_model).cuda()
     # 2、构建feed forward网络
-    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-    position = PositionalEncoding(d_model, dropout)   
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout).cuda()
+    position = PositionalEncoding(d_model, dropout).cuda()
     # 3、构建transformer模型
     model = EncoderDecoder(
-        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
-        Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
-        nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
-        nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
-        # Embeddings(d_model, src_vocab), # inputs的编码器
-        # Embeddings(d_model, tgt_vocab), # outputs的编码器
-        Generator(d_model, tgt_vocab), # 用于预测下一个token
+        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N).cuda(),
+        Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout).cuda(), N).cuda(),
+        nn.Sequential(Embeddings(d_model, src_vocab).cuda(), c(position).cuda()),
+        nn.Sequential(Embeddings(d_model, tgt_vocab).cuda(), c(position).cuda()),
+        Generator(d_model, tgt_vocab).cuda(), # 用于预测下一个token
         d_model
-    )
+    ).cuda()
 
     # This was important from their code.
     # Initialize parameters with Glorot / fan_avg.
@@ -504,25 +490,25 @@ class Batch:
     """Object for holding a batch of data with mask during training."""
 
     def __init__(self, src, tgt=None, pad=2):  # 2 = <blank>
-        self.src = src
-        self.src_mask = (src != pad).unsqueeze(-2) # 将src中pad部分mask掉，然后将维度与scores保持一致
-        if tgt is not None:
-            self.tgt = tgt[:, :-1] # 去掉最后一个词，tgt存储的是decoder的输入，所以不会出现最后一个词，即`<bos> 我 爱 你`（没有'<eos>'）
-            self.tgt_y = tgt[:, 1:] # tgt_y存储希望预测的结果，去掉第一个词'<bos>'，即“我 爱 你 <eos>”
-            self.tgt_mask = self.make_std_mask(self.tgt, pad)
-            self.ntokens = (self.tgt_y != pad).data.sum() # 该batch的tgt_y的总token的数量，去除'pad'部分的词数，同时前面也去掉了'<bos>'
+        self.src = src  # 与EncoderDecoder中forward函数的src一致
+        self.src_mask = (src != pad).unsqueeze(-2) # 将src中pad部分掩盖，使维度与scores保持一致
+        if tgt is not None: # tgt即目标句子
+            self.tgt = tgt[:, :-1] # 需要去掉最后一个词，tgt存储的是decoder的输入，所以不会出现最后一个词，即`<bos> 我 爱 你`（没有'<eos>'）
+            self.tgt_y = tgt[:, 1:] # tgt_y存储希望预测的结果，即decoder的预测输出结果，去掉第一个词'<bos>'，即“我 爱 你 <eos>”
+            self.tgt_mask = self.make_std_mask(self.tgt, pad) # tgt_mask & subsequent_mask
+            self.ntokens = (self.tgt_y != pad).data.sum() # 该batch的tgt_y的总token的数量，去除'pad'部分的词数，同时也去掉了前面的'<bos>'
 
     @staticmethod
     def make_std_mask(tgt, pad): # 生成tgt_mask
         "Create a mask to hide padding and future words."
         tgt_mask = (tgt != pad).unsqueeze(-2) # 生成非句子成分的mask，加入pad
-        tgt_mask = tgt_mask & subsequent_mask(tgt.size(-1)).type_as( # 两个mask取&
+        tgt_mask = tgt_mask & subsequent_mask(tgt.size(-1)).type_as( 
             tgt_mask.data
         )
         return tgt_mask
     
-"""Training Loop"""
-class TrainState:   # 保存一些训练状态
+# 用于保存一些训练状态
+class TrainState:  
     """Track number of steps, examples, and tokens processed"""
     # 一个batch算一次，或者一次loss.backward()算一次。可能累计多次loss然后进行一次optimizer.step()
     step: int = 0  # Steps in the current epoch
@@ -533,6 +519,7 @@ class TrainState:   # 保存一些训练状态
     # 记录处理过的target的token数量
     tokens: int = 0  # total # of tokens processed
     
+# 进行一个epoch训练
 def run_epoch(
     data_iter,  # 可迭代对象，一次返回一个batch对象
     model,      # transformer模型，EncoderDecoder类对象
@@ -540,8 +527,8 @@ def run_epoch(
     optimizer,  # Adam优化器，验证时的optimizer是DummyOptimizer
     scheduler,  # LambdaLR对象，用于调整Adam的学习率，实现WarmUp。验证时的scheduler是DummyScheduler
     mode="train",
-    accum_iter=1,
-    train_state=TrainState(),
+    accum_iter=1, # 多少个batch更新一次参数，默认为1，每个batch都对参数进行更新
+    train_state=TrainState(), # TrainState对象，用于保存一些训练状态
 ):
     """Train a single epoch"""
     start = time.time()
@@ -550,9 +537,9 @@ def run_epoch(
     tokens = 0          # 记录target的总token数，每次打印日志后清零
     n_accum = 0         # 本次epoch的参数更新次数
     for i, batch in enumerate(data_iter):
-        out = model.forward(    # out是decoder输出
+        out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中
             batch.src, batch.tgt, batch.src_mask, batch.tgt_mask 
-        )
+        ).cuda()
         """
         计算损失，传入的三个参数分别为：
         1. out: EncoderDecoder的输出，该值并没有过最后的线性层，该线性层被集成在了计算损失中
@@ -560,19 +547,21 @@ def run_epoch(
                   `我 爱 你 <eos>`
         3. ntokens：这批batch中有效token的数量。用于对loss进行正则化。
 
-        返回两个loss，其中loss_node是正则化之后的，所以梯度下降时用这个。
-                    而loss是未进行正则化的，用于统计total_loss。
+        返回两个loss，其中loss_node是正则化之后的，所以梯度下降时用这个。而loss是未进行正则化的，用于统计total_loss。
         """
         loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)
         # loss_node = loss_node / accum_iter
         if mode == "train" or mode == "train+log":
             loss_node.backward() # 计算梯度
+            
             train_state.step += 1 # 计算step次数
-            train_state.samples += batch.src.shape[0] # 记录样本数量，batch.src.shape[0]获取的是Batch size
+            train_state.samples += batch.src.shape[0] # 记录样本数量，batch.src.shape[0]获取的是batch_size
             train_state.tokens += batch.ntokens # 记录处理过的token数
+            
             if i % accum_iter == 0: # 如果达到了accum_iter次，就进行一次参数更新
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                
                 n_accum += 1    # 记录本次epoch的参数更新次数
                 train_state.accum_step += 1 # 记录模型的参数更新次数Epoc
             scheduler.step()    # 更新学习率
@@ -588,7 +577,8 @@ def run_epoch(
             n_accum: 本次epoch更新了多少次模型参数
             loss / batch.ntokens: 对loss进行正则化，然后再打印loss，其实这里可以直接用loss_node
             tokens / elapsed: 每秒可以处理的token数
-            lr: 学习率（learning rate），这里打印学习率的目的是看一下warmup下学习率的变化
+            lr: 学习率（learning rate），这里打印学习率的目的是看一下warmup下学习率的变化。
+            注意：学习率过低，损失函数的变化速度就越慢，容易过拟合。学习率过高，容易发生梯度爆炸，loss振动幅度越大，模型难以收敛。
             """
             print(
                 (
@@ -601,9 +591,9 @@ def run_epoch(
             tokens = 0  # 重置tokens数
         del loss
         del loss_node
-    return total_loss / total_tokens, train_state   # 返回正则化之后的total_loss，返回训练状态
+    return total_loss / total_tokens.cuda(), train_state   # 返回正则化之后的total_loss，返回训练状态
 
-# 学习率调整函数。若设置的学习率为0.8，则第i步的学习率为0.8*该函数的返回值
+# 学习率调整函数
 def rate(step, model_size, factor, warmup):
     """
     we have to default the step to 1 for LambdaLR function
@@ -616,19 +606,17 @@ def rate(step, model_size, factor, warmup):
         model_size ** (-0.5) * min(step ** (-0.5), step * warmup ** (-1.5))
     )
     
-# 标签平滑（正则化，防止过拟合） + 计算损失
-# 在训练时即假设标签可能存在错误，避免“过分”相信训练样本的标签。当目标函数为交叉熵时，称为标签平滑（Label Smoothing）。平滑指的是把两个极端值0和1变成两个不那么极端的值，如[0,0,0,1,0]平滑后的label为[0.05,0.05,0.05,0.8,0.05]
+# 标签平滑（正则化，减少过拟合） + 计算损失
+# 在训练时即假设标签可能存在错误，避免“过分”相信训练样本的标签。之后计算loss的时候，使用平滑后的标签。当目标函数为交叉熵时，称为标签平滑（Label Smoothing）。平滑指的是把两个极端值0和1变成两个不那么极端的值，如[0,0,0,1,0]平滑后的label为[0.05,0.05,0.05,0.8,0.05]
 class LabelSmoothing(nn.Module):
-    "Implement label smoothing."
-    
     """
     size: 目标词典的大小。
-    padding_idx: 空格('<blank>')在词典中对应的index，`<blank>`等价于`<pad>`
+    padding_idx: 空格('<blank>')在词典中对应的index，`<blank>`等价于`<pad>`，LabelSmoothing的时候不应该让<pad>参与。
     smoothing: 平滑因子，0表示不做平滑处理
     """
     def __init__(self, size, padding_idx, smoothing=0.0): 
         super(LabelSmoothing, self).__init__()
-        self.criterion = nn.KLDivLoss(reduction="sum") # 定义损失函数KL散度
+        self.criterion = nn.KLDivLoss(reduction="sum") # 定义损失函数KL散度，是一种多分类常用的损失函数，官方文档见https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
@@ -640,28 +628,34 @@ class LabelSmoothing(nn.Module):
         x: generator输出的概率分布。Shape为(batch_size, 词典大小)
         target: 目标标签。Shape为(batch_size)
         """
-        assert x.size(1) == self.size   # 确保generator的输出维度与词典大小一致，否则计算损失会出错
-        true_dist = x.data.clone()  # 创建一个与x有相同shape的tensor
+        assert x.size(1) == self.size   # 确保generator的输出维度与词典大小一致，否则计算loss会出错
+        
+        true_dist = x.data.clone().cuda()   # 创建一个与x有相同shape的tensor
         true_dist.fill_(self.smoothing / (self.size - 2)) # 将true_dist全部填充为 self.smoothing / (self.size - 2)
-        true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence) # 将true_dist的dim=1上与target.data.unsqueeze(1)索引对应的值变为src
+        true_dist.scatter_(1, target.data.unsqueeze(1).cuda() , self.confidence)  # 将true_dist的dim=1上与target.data.unsqueeze(1)索引对应的值变为src
         true_dist[:, self.padding_idx] = 0 # 将空格所在的index填充为0
-        mask = torch.nonzero(target.data == self.padding_idx)
+        mask = torch.nonzero(target.data == self.padding_idx) # 找出target中label为<blank>的标签
         if mask.dim() > 0:
-            true_dist.index_fill_(0, mask.squeeze(), 0.0) # 将"<blank>"所在的label整个设置为0
+            true_dist.index_fill_(0, mask.squeeze().cuda() , 0.0) # 将"<blank>"所在的label整个设置为0
         self.true_dist = true_dist # 保存平滑后的标签
-        return self.criterion(x, true_dist.clone().detach()) # 使用平滑后的标签计算损失，由于对`<blank>`部分进行了mask，所以在这部分不参与损失计算
+        # 使用平滑后的标签计算损失，由于对`<blank>`部分进行了mask，所以在这部分不参与损失计算
+        return self.criterion(x, true_dist.clone().detach()) 
 
 # 造数据    
 def data_gen(V, batch_size, nbatches): 
-    # V：随机生成数字的最大值+1，batch_size是每次输入到模型更新一次参数的数据量，一共输入nbatch个batch完成一轮epoch
-    "Generate random data for a src-tgt copy task."
-    for i in range(nbatches): # 遍历batch
+    """
+    生成一组随机数据
+    V: 词典的大小
+    batch_size：有多少句话
+    nbatches: 一共输入nbatch个batch完成一轮epoch
+    return: yield一个Batch对象
+    """
+    for i in range(nbatches): # 遍历batch，生成nbatch个batch
         data = torch.randint(1, V, size=(batch_size, 10))
-        # data = data = torch.randint(1, batch_size * 3 +1, size=(batch_size, 10))
         data[:, 0] = 1 # 将每行的第一个词改为1，即"<bos>"
         src = data.requires_grad_(False).clone().detach() # 该数据不需要梯度下降
         tgt = data.requires_grad_(False).clone().detach()
-        yield Batch(src, tgt, 0) # yield返回值后继续执行函数体内代码，返回一个Batch对象
+        yield Batch(src, tgt, 0) # yield返回值后，继续执行函数体内代码，返回一个Batch对象
 
 # 损失计算 + generator部分的前向传递        
 class SimpleLossCompute:
@@ -677,7 +671,8 @@ class SimpleLossCompute:
         y: batch.tgt_y，要被预测的所有token，例如src为`<bos> I love you <eos>`，则`tgt_y`则为`我 爱 你 <eos>`，即去掉<bos>的目标句子
         norm: batch.ntokens, tgt_y中的有效token数。用于对loss进行正则化。
         """
-        x = self.generator(x) # x为调用generator输出的概率分布(EncoderDecoder的forward中并没有调用generator)
+        # x为调用generator输出的概率分布(EncoderDecoder的forward中并没有调用generator)
+        x = self.generator(x) 
         # 使用KL散度计算损失，然后/norm对loss进行正则化，防止loss过大过小，取其平均数。
         sloss = (
             self.criterion(
@@ -686,30 +681,29 @@ class SimpleLossCompute:
                 x.contiguous().view(-1, x.size(-1)), y.contiguous().view(-1)
             )
             / norm
-        )
+        ).cuda()
         return sloss.data * norm, sloss
 
-# 翻译任务的预测：先求出encoder的输出memory，然后利用memory一个一个求出token
-# 与inference_test()代码相同
+# 翻译任务的预测：先求出encoder的输出memory，然后利用memory一个一个求出token，与前面的inference_test()代码相同
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
     """
-    进行模型推理，推理出所有预测结果。
+    进行模型推理，推理出所有预测结果
     model: Transformer模型，即EncoderDecoder类对象
     src: Encoder的输入inputs，Shape为(batch_size, 词数)。例如：[[1, 2, 3, 4, 5, 6, 7, 8, 0, 0]]，即一个句子，该句子有10个词，分别为1,2,...,0
-    src_mask: src的掩码，掩盖住非句子成分
+    src_mask: src的掩码，掩盖住非句子成分，将其填充到等长
     max_len: 一个句子的最大长度
     start_symbol: '<bos>' 对应的index，在本例中始终为0
     return: 预测结果，例如[[1, 2, 3, 4, 5, 6, 7, 8]]
     """
-    memory = model.encode(src, src_mask) # 将src送入模型的encoder
+    memory = model.encode(src, src_mask).cuda() # memory为encode最后一层的输出
     # 初始化ys为[[0]]，用于保存预测结果，其中0表示'<bos>'
-    ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
+    ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data).cuda()
     # 循环调用decoder，一个个进行预测，直到decoder输出"<eos>"或达到句子最大长度
     for i in range(max_len - 1):
         # 将memory和decoder之前的输出作为参数，预测下一个token
         out = model.decode(
             memory, src_mask, ys, subsequent_mask(ys.size(1)).type_as(src.data)
-        )
+        ).cuda()
         # 每次取decoder最后一个词的输出送给generator进行预测
         prob = model.generator(out[:, -1]) 
         # 取出数值最大的那个，它的index在词典中对应的词就是预测结果
@@ -717,7 +711,7 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
         next_word = next_word.data[0]   # 取出预测结果
         # 将这一次的预测结果和之前的拼到一起，作为之后decoder的输入
         ys = torch.cat(
-            [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
+            [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word).cuda()], dim=1
         )
     return ys   # 返回最终的预测结果
 
@@ -728,8 +722,8 @@ def example_simple_model():
  
     # 定义损失函数
     criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
-    # 构建模型，src和tgt的词典大小都为2，Layer数量为2
-    model = make_model(V, V, N=2)
+    # 构建模型，src和tgt的词典大小都为V，N为encode和decode层数
+    model = make_model(V, V, N=2).cuda()
 
     # 使用Adam优化器
     optimizer = torch.optim.Adam(
@@ -740,18 +734,23 @@ def example_simple_model():
     lr_scheduler = LambdaLR(
         optimizer=optimizer,
         lr_lambda=lambda step: rate(
-            step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400
+            step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400 # wanrmup400次，即从第400次学习率开始下降
         ),
     )
 
-    # batch_size = 80
-    # V = batch_size * 3 +1
-    for epoch in range(30): # 运行20个epoch
+    # 传入的参数是指向文件夹的路径，之后需要使用writer对象取出的任何数据都保存在这个路径之下
+    # image_path = r"D:\Master_Files\SC\Experiment\image\result1"
+    # writer = SummaryWriter(image_path)
+    
+    for epoch in range(100): # 运行几个epoch
         model.train() # 将模型调整为训练模式
+        loss1 = SimpleLossCompute(model.generator, criterion)
+        loss2 = SimpleLossCompute(model.generator, criterion)
         run_epoch(  # 训练一个Batch
             data_gen(V, batch_size, 20), # 生成20个batch对象进行训练
-            model,
-            SimpleLossCompute(model.generator, criterion),
+            model.cuda(),
+            # SimpleLossCompute(model.generator, criterion),
+            loss1,
             optimizer,
             lr_scheduler,
             mode="train",
@@ -759,20 +758,24 @@ def example_simple_model():
         model.eval() # 进行一个epoch后进行模型验证
         run_epoch(
             data_gen(V, batch_size, 5), # 生成5个对象进行验证
-            model,
-            SimpleLossCompute(model.generator, criterion),
+            model.cuda(),
+            # SimpleLossCompute(model.generator, criterion),
+            loss2,
             DummyOptimizer(), # 验证时不进行参数更新
             DummyScheduler(), # 验证时不调整学习率
             mode="eval",
-        )[0] # run_epoch返回loss和train_state，这里只取loss，所以是[0]。但是源码中没有接收这个loss，所以[0]没有实际意义
+        )[0].cuda() # run_epoch返回loss和train_state，这里只取loss，所以是[0]。但是源码中没有接收这个loss，所以[0]没有实际意义
 
-    # 将模型调整为测试模式，准备开始推理
+
+    # 生成x轴跨度为100的折线图，y轴坐标代表每一个epoch的损失函数，这个折线图会保存在指定的路径下
+    # writer.add_scalar('loss1', loss1.avg, epoch)
+    # writer.add_scalar('loss2', loss2.avg, epoch)
+    
+    # 将模型调整为测试模式，准备开始copy任务
     model.eval()
     # 定义src为0-9，看看模型能否重新输出0-9
     src = torch.LongTensor([[0, 2, 2, 3, 4, 5, 6, 7, 8, 9]])
-    # src = torch.LongTensor([[0, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
-    # src = torch.LongTensor([[0, 22, 23]])
-    # 句子的最大长度是10
+    # 句子的最大长度是src第二维的值
     max_len = src.shape[1]
     # 不需要mask，因为这10个都是有意义的数字
     src_mask = torch.ones(1, 1, max_len)
@@ -780,8 +783,8 @@ def example_simple_model():
     print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0)) # Loss:0.11     tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
     # 获取下标对应的值
     IDIndex = greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0)
-    IDIndex = IDIndex.detach().numpy()
-    getData(IDIndex, batch_size)
+    IDIndex = IDIndex.detach().cpu().numpy()  # 将tensor变量转换为数组
+    getData(IDIndex)
 
 
 execute_example(example_simple_model)
