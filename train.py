@@ -1,9 +1,11 @@
 import copy
+from email import generator
 import math
 import os
 import sys
 import time
 from tkinter import image_names
+from turtle import forward
 import warnings  # 用于忽略警告日志
 from os.path import exists
 
@@ -22,7 +24,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from DataProcess.data import getData
 
-
 """
 batch_size:即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
 length：即每个句子有多少个单词。
@@ -36,6 +37,30 @@ RUN_EXAMPLES = True
 
 batch_size = 80
 V = 1001
+EpochRange = 500
+Epoch = 0
+Epoch_eval = 0
+
+AccuracyNum = 0     
+AccuracyEval = 0
+
+train_batch = 20    # 训练多少个batch
+eval_batch = 5      # 验证多少个batch
+
+length = 3     # 每句话多少个单词
+
+reduced_dim = 32   # 线性层降低的维度
+
+# 量化器函数
+def Quantization(SigmoidData):
+    # Quantization and De-quantization
+    N = 16
+    stepsize = (1.0-(0))/(2**N)
+    # Encode
+    Migmoid_quant_rise_ind = torch.floor(SigmoidData / stepsize)
+    # Decode
+    Migmoid_quant_rise_ind = Migmoid_quant_rise_ind * stepsize + stepsize / 2
+    return Migmoid_quant_rise_ind 
 
 def is_interactive_notebook():
     return __name__ == "__main__"
@@ -66,19 +91,8 @@ class DummyOptimizer(torch.optim.Optimizer):
 class DummyScheduler:
     def step(self):
         None
+   
     
-# 量化器
-def Quantization(SigmoidData):
-    # Quantization and De-quantization
-    N = 4
-    stepsize = (1.0-(0))/(2**N)
-    # Encode
-    Migmoid_quant_rise_ind = torch.floor(SigmoidData / stepsize)
-    # Decode
-    Migmoid_quant_rise_ind = Migmoid_quant_rise_ind * stepsize + stepsize / 2
-    
-    return Migmoid_quant_rise_ind    
-        
 # 标准的模型架构，返回值为decoder输出
 class EncoderDecoder(nn.Module):
     """
@@ -95,9 +109,10 @@ class EncoderDecoder(nn.Module):
         self.generator = generator.cuda()
 
         # 自定义部分
-        self.linear1 = nn.Linear(d_model, 510).cuda()
-        self.linear2 = nn.Linear(510,d_model).cuda()
+        self.linear1 = nn.Linear(d_model, reduced_dim).cuda()
+        self.linear2 = nn.Linear(reduced_dim, d_model).cuda()
         self.sigmoid = nn.Sigmoid().cuda()
+
 
     def forward(self, src, tgt, src_mask, tgt_mask):
         "Take in and process masked src and target sequences."
@@ -105,11 +120,11 @@ class EncoderDecoder(nn.Module):
         x = self.encode(src, src_mask).cuda()
         
         x = self.linear1(x) # 降维
-        x = self.sigmoid(x).cuda()
-        x = Quantization(x).cuda()
-        output = self.linear2(x)
-
-        return self.decode(output, src_mask, tgt, tgt_mask).cuda()
+        x = self.sigmoid(x)
+        x = Quantization(x)
+        x = self.linear2(x)
+        
+        return self.decode(x, src_mask, tgt, tgt_mask).cuda()
 
 
     def encode(self, src, src_mask):
@@ -117,7 +132,8 @@ class EncoderDecoder(nn.Module):
 
     def decode(self, memory, src_mask, tgt, tgt_mask):
         return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask).cuda()
-    
+
+
 # 将decoder结果输入到Linear + Softmax，预测下一个token
 class Generator(nn.Module):
     "Define standard linear + softmax generation step."
@@ -440,51 +456,6 @@ def make_model(
             nn.init.xavier_uniform_(p)
     return model
 
-"""
-# 推理(inference) 在训练之前用来测试模型，没有给出损失函数，因此输出是随机的
-    # 原词典和目标词典大小都为11，encoderlayer和decoderlayer都是2层
-    test_model = make_model(11, 11, 2)
-    test_model.eval()
-    # 定义inputs，shape为[1, 10]，即一个句子，每个句子10个单词
-    src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
-    # 定义src_mask，即所有的单词为1，都是有效的，没有pad
-    src_mask = torch.ones(1, 1, 10)
-
-    # inputs经ecoder之后，得到memory
-    memory = test_model.encode(src, src_mask)
-    # 初始化真实值为[[0]]，用于保存预测结果，其中0表示'bos'
-    ys = torch.zeros(1, 1).type_as(src)
-
-    for i in range(9):
-        # ys.size(1)指第二个维度有几个数据，有几个单词就生成(1, size, size) 的下三角为1的mask矩阵。.size()函数如下所示：
-        # a = torch.tensor([[1,2,3], [4,5,6]])
-        # print(a.size(0))    # 2 第0维有[1,2,3]和[4,5,6]两个数据
-        # print(a.size(1))    # 3 第1维有1，2，3（或4，5，6）三个数据
-        out = test_model.decode(
-            memory, src_mask, ys, subsequent_mask(ys.size(1)).type_as(src.data) 
-        )
-        # out维度变化的是[batch_size, 词数，词向量]中词数这个维度（decoder一个一个输出词），因此每次只取最后一个词
-        prob = test_model.generator(out[:, -1])
-        # _即最大值，next_word即最大值对应的索引
-        _, next_word = torch.max(prob, dim=1)
-        # 取出预测结果
-        next_word = next_word.data[0]
-        # 将本次的预测结果与之前的预测结果进行拼接，作为之后decoder的输入
-        ys = torch.cat(
-            [ys, torch.empty(1, 1).type_as(src.data).fill_(next_word)], dim=1
-        )
-
-    print("Example Untrained Model Prediction:", ys)
-
-
-def run_tests():
-    for _ in range(10):
-        inference_test()
-
-
-show_example(run_tests)
-"""
-
 # 定义一个batch，存放一个batch的src，tgt，src_mask等对象，方便后续使用
 class Batch:
     """Object for holding a batch of data with mask during training."""
@@ -520,12 +491,13 @@ class TrainState:
     tokens: int = 0  # total # of tokens processed
     
 # 进行一个epoch训练
-def run_epoch(
+def run_epoch_train(
     data_iter,  # 可迭代对象，一次返回一个batch对象
     model,      # transformer模型，EncoderDecoder类对象
     loss_compute,   # SimpleLossCompute对象，用于计算损失
     optimizer,  # Adam优化器，验证时的optimizer是DummyOptimizer
     scheduler,  # LambdaLR对象，用于调整Adam的学习率，实现WarmUp。验证时的scheduler是DummyScheduler
+    writer,
     mode="train",
     accum_iter=1, # 多少个batch更新一次参数，默认为1，每个batch都对参数进行更新
     train_state=TrainState(), # TrainState对象，用于保存一些训练状态
@@ -533,7 +505,12 @@ def run_epoch(
     """Train a single epoch"""
     start = time.time()
     total_tokens = 0    # 记录tgt_y(去掉bos)的总token数，用于对total_loss进行正则化
-    total_loss = 0      
+    
+    total_loss = 0     # 损失函数初始化
+    total_acc = 0      # 准确率初始化
+    
+    
+    
     tokens = 0          # 记录target的总token数，每次打印日志后清零
     n_accum = 0         # 本次epoch的参数更新次数
     for i, batch in enumerate(data_iter):
@@ -549,27 +526,31 @@ def run_epoch(
 
         返回两个loss，其中loss_node是正则化之后的，所以梯度下降时用这个。而loss是未进行正则化的，用于统计total_loss。
         """
-        loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)
+        loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)     # 计算loss函数
         # loss_node = loss_node / accum_iter
+            
         if mode == "train" or mode == "train+log":
-            loss_node.backward() # 计算梯度
+            loss_node.backward() # 模型训练第一步：反向传播，计算得到每个参数的梯度值
             
             train_state.step += 1 # 计算step次数
             train_state.samples += batch.src.shape[0] # 记录样本数量，batch.src.shape[0]获取的是batch_size
             train_state.tokens += batch.ntokens # 记录处理过的token数
             
             if i % accum_iter == 0: # 如果达到了accum_iter次，就进行一次参数更新
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                
+                optimizer.step()    # 模型训练第二步：通过梯度下降执行一步参数更新，其目的是降低loss值
+                optimizer.zero_grad(set_to_none=True)   # 模型训练第三步：将梯度归零
+
                 n_accum += 1    # 记录本次epoch的参数更新次数
-                train_state.accum_step += 1 # 记录模型的参数更新次数Epoc
+                train_state.accum_step += 1 # 记录模型的参数更新次数Epoch
             scheduler.step()    # 更新学习率
 
         total_loss += loss  # 累计loss
         total_tokens += batch.ntokens   # 累计处理过的tokens
         tokens += batch.ntokens # 累计从上次打印日志开始处理过的tokens
+        
         if i % 40 == 1 and (mode == "train" or mode == "train+log"): # 每40个batch打印一次日志
+            global AccuracyNum
+            
             lr = optimizer.param_groups[0]["lr"]    # 打印当前的学习率
             elapsed = time.time() - start   # 记录40个batch消耗的时间
             """        打印日志
@@ -585,10 +566,105 @@ def run_epoch(
                     "Epoch Step: %6d | Accumulation Step: %3d | Loss: %6.2f "
                     + "| Tokens / Sec: %7.1f | Learning Rate: %6.1e"
                 )
-                % (i, n_accum, loss / batch.ntokens, tokens / elapsed, lr)
-            )
+                % (i, n_accum, loss / batch.ntokens, tokens / elapsed, lr)  # batch_size * nbatch
+            )   
+            
+            
+        # 计算准确率
+        prob = model.generator(out)     # 预测输出的概率分布
+        # print(prob.shape)
+        d, next_word = torch.max(prob, dim=2)   # d:概率最大的值；next_word:概率最大的值对应的下标
+        # print(next_word.shape)
+        global Epoch
+        Epoch = Epoch + 1
+        if(i == train_batch-1 and mode == 'train'):
+            # print("kkkk",next_word,d,batch.tgt_y)
+
+            AccuracyNum = 0
+            PrecIndex = next_word.detach().cpu().numpy()  # 预测输出的值
+            OriIndex = batch.tgt_y.detach().cpu().numpy()  # 平滑后的标签
+            # print(next_word.shape, batch.tgt_y.shape)
+            for item in range(batch_size): # batch_size = 80
+                for idx in range(length-1): # length = 10
+                    if(PrecIndex[item][idx] == OriIndex[item][idx]):
+                        AccuracyNum += 1 
+            # print("epoch", AccuracyNum / 720, AccuracyNum) 
+                     
+            writer.add_scalar(tag='Loss/train', scalar_value=loss/batch.ntokens, global_step=Epoch/train_batch)
+            writer.add_scalar(tag='Accuracy/train', scalar_value=AccuracyNum/(batch_size*(length-1)), global_step=Epoch/train_batch)
+            
+            
+            
             start = time.time() # 重置开始时间
             tokens = 0  # 重置tokens数
+        
+        del loss
+        del loss_node
+    return total_loss / total_tokens.cuda(), train_state   # 返回正则化之后的total_loss，返回训练状态
+
+# 进行一个epoch训练 (测试)
+def run_epoch_eval(
+    data_iter,  # 可迭代对象，一次返回一个batch对象
+    model,      # transformer模型，EncoderDecoder类对象
+    loss_compute,   # SimpleLossCompute对象，用于计算损失
+    optimizer,  # Adam优化器，验证时的optimizer是DummyOptimizer
+    scheduler,  # LambdaLR对象，用于调整Adam的学习率，实现WarmUp。验证时的scheduler是DummyScheduler
+    writer,
+    mode="eval",
+    accum_iter=1, # 多少个batch更新一次参数，默认为1，每个batch都对参数进行更新
+    train_state=TrainState(), # TrainState对象，用于保存一些训练状态
+):
+    """Train a single epoch"""
+    start = time.time()
+    total_tokens = 0    # 记录tgt_y(去掉bos)的总token数，用于对total_loss进行正则化
+    
+    total_loss = 0     # 损失函数初始化
+    total_acc = 0      # 准确率初始化
+    
+    tokens = 0          # 记录target的总token数，每次打印日志后清零
+    n_accum = 0         # 本次epoch的参数更新次数
+    for i, batch in enumerate(data_iter):
+        out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中
+            batch.src, batch.tgt, batch.src_mask, batch.tgt_mask 
+        ).cuda()
+        """
+        计算损失，传入的三个参数分别为：
+        1. out: EncoderDecoder的输出，该值并没有过最后的线性层，该线性层被集成在了计算损失中
+        2. tgt_y: 要被预测的所有token，例如src为`<bos> I love you <eos>`，则`tgt_y`则为
+                  `我 爱 你 <eos>`
+        3. ntokens：这批batch中有效token的数量。用于对loss进行正则化。
+
+        返回两个loss，其中loss_node是正则化之后的，所以梯度下降时用这个。而loss是未进行正则化的，用于统计total_loss。
+        """
+        loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)     # 计算loss函数
+        # loss_node = loss_node / accum_iter
+    
+        total_loss += loss  # 累计loss     
+        total_tokens += batch.ntokens   # 累计处理过的tokens
+        tokens += batch.ntokens # 累计从上次打印日志开始处理过的tokens
+     
+        # 计算准确率
+        prob = model.generator(out)     # 预测输出的概率分布
+        # print(prob.shape)
+        d, next_word = torch.max(prob, dim=2)   # d:概率最大的值；next_word:概率最大的值对应的下标
+        global Epoch_eval
+        Epoch_eval = Epoch_eval + 1
+        if(i == eval_batch-1):
+            global AccuracyEval
+            AccuracyEval = 0
+            PrecIndex = next_word.detach().cpu().numpy()  # 预测输出的值
+            OriIndex = batch.tgt_y.detach().cpu().numpy()  # 平滑后的标签
+            # print(next_word.shape, batch.tgt_y.shape)
+            for item in range(batch_size):
+                for idx in range(length-1):
+                    if(PrecIndex[item][idx] == OriIndex[item][idx]):
+                        AccuracyEval += 1 
+            # print("测试epoch", AccuracyEval / 0.072, AccuracyEval) 
+            
+            writer.add_scalar(tag='Loss/eval', scalar_value=loss/batch.ntokens, global_step=Epoch_eval/eval_batch)
+            writer.add_scalar(tag='Accuracy/eval', scalar_value=AccuracyEval/(batch_size*(length-1)), global_step=Epoch_eval/eval_batch)
+            
+            
         del loss
         del loss_node
     return total_loss / total_tokens.cuda(), train_state   # 返回正则化之后的total_loss，返回训练状态
@@ -651,7 +727,8 @@ def data_gen(V, batch_size, nbatches):
     return: yield一个Batch对象
     """
     for i in range(nbatches): # 遍历batch，生成nbatch个batch
-        data = torch.randint(1, V, size=(batch_size, 10))
+        data = torch.randint(1, V, size=(batch_size, length)) # batch_size句话，每句话长度位length
+        # print(data)
         data[:, 0] = 1 # 将每行的第一个词改为1，即"<bos>"
         src = data.requires_grad_(False).clone().detach() # 该数据不需要梯度下降
         tgt = data.requires_grad_(False).clone().detach()
@@ -666,7 +743,7 @@ class SimpleLossCompute:
         self.criterion = criterion  # labelsmoothing对象，对label进行平滑和计算损失
 
     def __call__(self, x, y, norm):
-        """
+        """length
         x: Decoder的输出，还没有进入generator，x:[batch_size, 词数, d_model]
         y: batch.tgt_y，要被预测的所有token，例如src为`<bos> I love you <eos>`，则`tgt_y`则为`我 爱 你 <eos>`，即去掉<bos>的目标句子
         norm: batch.ntokens, tgt_y中的有效token数。用于对loss进行正则化。
@@ -707,7 +784,7 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
         # 每次取decoder最后一个词的输出送给generator进行预测
         prob = model.generator(out[:, -1]) 
         # 取出数值最大的那个，它的index在词典中对应的词就是预测结果
-        _, next_word = torch.max(prob, dim=1)
+        _, next_word = torch.max(prob, dim=1)                                
         next_word = next_word.data[0]   # 取出预测结果
         # 将这一次的预测结果和之前的拼到一起，作为之后decoder的输入
         ys = torch.cat(
@@ -723,7 +800,7 @@ def example_simple_model():
     # 定义损失函数
     criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
     # 构建模型，src和tgt的词典大小都为V，N为encode和decode层数
-    model = make_model(V, V, N=2).cuda()
+    model = make_model(V, V, N=4).cuda()
 
     # 使用Adam优化器
     optimizer = torch.optim.Adam(
@@ -737,54 +814,53 @@ def example_simple_model():
             step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400 # wanrmup400次，即从第400次学习率开始下降
         ),
     )
-
-    # 传入的参数是指向文件夹的路径，之后需要使用writer对象取出的任何数据都保存在这个路径之下
-    # image_path = r"D:\Master_Files\SC\Experiment\image\result1"
-    # writer = SummaryWriter(image_path)
-    
-    for epoch in range(100): # 运行几个epoch
+    writer = SummaryWriter()
+    for epoch in range(EpochRange): # 运行几个epoch
         model.train() # 将模型调整为训练模式
-        loss1 = SimpleLossCompute(model.generator, criterion)
-        loss2 = SimpleLossCompute(model.generator, criterion)
-        run_epoch(  # 训练一个Batch
-            data_gen(V, batch_size, 20), # 生成20个batch对象进行训练
+        Epoitem = epoch
+        # print(Epoitem)
+        
+        run_epoch_train(  # 训练一个Batch
+            data_gen(V, batch_size, train_batch), # 生成20个batch对象进行训练
             model.cuda(),
             # SimpleLossCompute(model.generator, criterion),
-            loss1,
+            SimpleLossCompute(model.generator, criterion),
             optimizer,
             lr_scheduler,
             mode="train",
+            writer=writer
         )
+        # torch.cuda.empty_cache() # 清理缓存
         model.eval() # 进行一个epoch后进行模型验证
-        run_epoch(
-            data_gen(V, batch_size, 5), # 生成5个对象进行验证
+        run_epoch_eval(
+            data_gen(V, batch_size, eval_batch), # 生成5个对象进行验证
             model.cuda(),
             # SimpleLossCompute(model.generator, criterion),
-            loss2,
+            SimpleLossCompute(model.generator, criterion),
             DummyOptimizer(), # 验证时不进行参数更新
             DummyScheduler(), # 验证时不调整学习率
             mode="eval",
+            writer=writer
         )[0].cuda() # run_epoch返回loss和train_state，这里只取loss，所以是[0]。但是源码中没有接收这个loss，所以[0]没有实际意义
-
-
-    # 生成x轴跨度为100的折线图，y轴坐标代表每一个epoch的损失函数，这个折线图会保存在指定的路径下
-    # writer.add_scalar('loss1', loss1.avg, epoch)
-    # writer.add_scalar('loss2', loss2.avg, epoch)
+    writer.close()
     
-    # 将模型调整为测试模式，准备开始copy任务
-    model.eval()
-    # 定义src为0-9，看看模型能否重新输出0-9
-    src = torch.LongTensor([[0, 2, 2, 3, 4, 5, 6, 7, 8, 9]])
-    # 句子的最大长度是src第二维的值
-    max_len = src.shape[1]
-    # 不需要mask，因为这10个都是有意义的数字
-    src_mask = torch.ones(1, 1, max_len)
-    # 使用greedy_decode进行推理
-    print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0)) # Loss:0.11     tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
-    # 获取下标对应的值
-    IDIndex = greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0)
-    IDIndex = IDIndex.detach().cpu().numpy()  # 将tensor变量转换为数组
-    getData(IDIndex)
-
+    # # 将模型调整为测试模式，准备开始copy任务
+    # model.eval()
+    # # 定义src为0-9，看看模型能否重新输出0-9
+    # # src = torch.LongTensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    # src = torch.LongTensor([[0, 1, 2]])
+    # # 句子的最大长度是src第二维的值
+    # max_len = src.shape[1]
+    # # 不需要mask，因为这10个都是有意义的数字
+    # src_mask = torch.ones(1, 1, max_len)
+    # # 使用greedy_decode进行推理
+    # print(greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0)) # Loss:0.11     tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    # # 获取下标对应的值
+    # IDIndex = greedy_decode(model, src, src_mask, max_len=max_len, start_symbol=0)
+    # IDIndex = IDIndex.detach().cpu().numpy()  # 将tensor变量转换为数组
+    # getData(IDIndex)
+    
 
 execute_example(example_simple_model)
+# 可视化结果
+# tensorboard --logdir=runs\Sep27_10-30-38_LAPTOP-UHS9699Q
