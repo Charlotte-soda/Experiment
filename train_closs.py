@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore") # 设置忽略警告
 RUN_EXAMPLES = True
 
 
-batch_size = 256 # 即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
+batch_size = 80 # 即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
 
 V = 1000
 
@@ -51,7 +51,7 @@ eval_batch = 5      # 验证多少个batch
 
 length = 3     # 每句话多少个单词
 
-n_layer = 6     # encoder和decoder的层数
+n_layer = 2     # encoder和decoder的层数
 
 reduced_dim = 256   # 线性层降低的维度
 
@@ -462,7 +462,7 @@ def make_model(
 
 # 定义一个batch，存放一个batch的src，tgt，src_mask等对象，方便后续使用
 class Batch:
-    """Object for holding a batch of data with mask during training."""
+    """Object for holding a batch of data with mask during training.训练期间用于保存一批带mask的数据的对象"""
 
     def __init__(self, src, tgt=None, pad=2):  # 2 = <blank>
         self.src = src  # 与EncoderDecoder中forward函数的src一致
@@ -507,20 +507,15 @@ def run_epoch_train(
     train_state=TrainState(), # TrainState对象，用于保存一些训练状态
 ):
     """Train a single epoch"""
-    # print("epoch顺序",3)
     start = time.time()
     total_tokens = 0    # 记录tgt_y(去掉bos)的总token数，用于对total_loss进行正则化
     total_loss = 0     # 损失函数初始化
     tokens = 0          # 记录target的总token数，每次打印日志后清零
     n_accum = 0         # 本次epoch的参数更新次数
     for i, batch in enumerate(data_iter):   # i：下标； batch：具体的element；一共训练20个batch，每个batch都是[80, 3]的随机下标
-        # print(batch.src, batch.src.shape, batch.tgt_y, batch.tgt_y.shape)
-        # out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中。out:[80, 2, 1000]
-        #     batch.src, batch.tgt, batch.src_mask, batch.tgt_mask 
-        # ).cuda()
         out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中。out:[80, 2, 1000]
-            batch.src, batch.tgt_y, batch.src_mask, batch.tgt_mask 
-        ).cuda()
+            batch.src, batch.tgt, batch.src_mask, batch.tgt_mask 
+        ).cuda()    # batch.tgt就是目标标签，这里传进来的目标标签不对
         
         # 将输入的索引转化为字典中的样本值，g1和g2均为80个
         g1,  g2 = case1_loss.value_to_g(case1_loss.index_to_value(batch.src[:, 1:]))
@@ -545,15 +540,13 @@ def run_epoch_train(
 
         prob = model.generator(out)     # 预测输出的概率分布，prob:[80, 2, 1000]
         d, next_word = torch.max(prob, dim=2)   # d:概率最大的值；next_word:概率最大的值对应的下标, next_word:[80, 2]
-        # print(next_word)
+        
         # 将输出的概率最大值的下标转换成样本值，g1_head和g2_head均为80个
         g1_head,  g2_head = case1_loss.value_to_g(case1_loss.index_to_value(next_word))
-        # print("g1_head", g1_head, len(g1_head))
-        # print("g2_head", g2_head, len(g2_head))
         # print(batch.ntokens, batch.ntokens.shape) # batch.ntokens = 160
         # 开始计算损失函数
         # out:[80, 2, 512], batch.tgt_y:[80, 2]
-        loss,  loss_node= loss_compute(out, batch.tgt_y, batch.ntokens / 2, g1, g2, g1_head, g2_head) # SimpleLloss_nodeossCompute经过generator层
+        loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens/2, g1, g2, g1_head, g2_head) # SimpleLossCompute经过generator层
         # loss_node = loss_node / accum_iter
             
         if mode == "train" or mode == "train+log":
@@ -646,11 +639,8 @@ def run_epoch_eval(
     tokens = 0          # 记录target的总token数，每次打印日志后清零
     n_accum = 0         # 本次epoch的参数更新次数
     for i, batch in enumerate(data_iter):
-        # out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中
-        #     batch.src, batch.tgt, batch.src_mask, batch.tgt_mask 
-        # ).cuda()
         out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中
-            batch.src, batch.tgt_y, batch.src_mask, batch.tgt_mask 
+            batch.src, batch.tgt, batch.src_mask, batch.tgt_mask 
         ).cuda()
         
         # 将输入的索引转化为字典中的样本值
@@ -732,8 +722,6 @@ class LabelSmoothing(nn.Module):
         super(LabelSmoothing, self).__init__()
         # KL散度，又叫相对熵，用于衡量两个分布（离散分布和连续分布）之间的距离
         self.criterion = nn.KLDivLoss(reduction="sum") 
-        # self.criterion = case1_loss.case1_loss1(g1, g2, g1_head, g2_head)
-    
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
@@ -741,7 +729,6 @@ class LabelSmoothing(nn.Module):
         self.true_dist = None # true distribution，平滑后的标签
 
     def forward(self, x, target, g1, g2, g1_head, g2_head):   # 概率分布(log之后为负值) x.shape:[160, 1000], 目标标签(正确答案的下标) target:[160]
-        # print("调用值",g1_head,g2_head)
         """
         x: generator输出的概率分布。
         target: 目标标签，即正确单词对应的下标。
@@ -769,7 +756,7 @@ class LabelSmoothing(nn.Module):
         
         # 原loss是计算x和true_dist两个概率分布的距离的和
         # x.shape:[160, 1000],  true_dist.shape:[160, 1000],  注意此处的true_dist仍然是one-hot编码(因为smoothing=0.0)
-        return self.criterion(x, true_dist.clone().detach())    # 返回值只有一个值，因为reduction="sum"，概率分布的距离的和
+        # return self.criterion(x, true_dist.clone().detach())    # 返回值只有一个值，因为reduction="sum"，概率分布的距离的和
 
 # 造数据    
 def data_gen(V, batch_size, nbatches): 
@@ -785,9 +772,17 @@ def data_gen(V, batch_size, nbatches):
         # print(data)
         data[:, 0] = 1 # 将每行的第一个词改为1，即"<bos>"
         src = data.requires_grad_(False).clone().detach() # 该数据不需要梯度下降
+        
+        # true_data = data[:, 1:] # 去掉第一列
+        # value = case1_loss.index_to_value(true_data)
+        # value = torch.tensor(np.array(value))
+        # print(value, value.shape)
+        
         tgt = data.requires_grad_(False).clone().detach()
-        # src:[80, 3], tgt = [80, 3]
+        # src:[80, 3], tgt = [80, 3], 第一列都是1
         # 一共生成20个[80,3]的src和tgt
+        # print("src", src, src.shape)
+        # print("tgt", tgt, tgt.shape)
         yield Batch(src, tgt, 0) # yield返回值后，继续执行函数体内代码，返回一个Batch对象
 
 # 损失计算 + generator部分的前向传递        
@@ -797,20 +792,17 @@ class SimpleLossCompute:
     def __init__(self, generator, criterion):
         self.generator = generator # 根据decoder的输出预测下一个token
         self.criterion = criterion  # labelsmoothing对象，对label进行平滑和计算损失
-        
 
     def __call__(self, x, y, norm, g1, g2, g1_head, g2_head):
-        
-        """d 
+        """length
         x: Decoder的输出，还没有进入generator，x:[batch_size, 词数, d_model]
         y: batch.tgt_y，要被预测的所有token，例如src为`<bos> I love you <eos>`，则`tgt_y`则为`我 爱 你 <eos>`，即去掉<bos>的目标句子
         norm: batch.ntokens, tgt_y中的有效token数。用于对loss进行正则化。
         """
-        # print("simple顺序",2)
         # x为调用generator输出的概率分布(EncoderDecoder的forward中并没有调用generator)
         x = self.generator(x) 
         # 使用KL散度计算损失，然后/norm对loss进行正则化，防止loss过大过小，取其平均数。
-        # print("qian",x.contiguous().view(-1, x.size(-1)))
+        
         sloss = (
             self.criterion(
                 # 概率分布(log之后为负值) x.shape:[160, 1000], 目标标签(正确答案的下标) y:[160]
@@ -819,7 +811,6 @@ class SimpleLossCompute:
             )
             / norm
         ).cuda()
-        # print("sloss",sloss)
         return sloss.data * norm, sloss
 
 # 翻译任务的预测：先求出encoder的输出memory，然后利用memory一个一个求出token，与前面的inference_test()代码相同
@@ -858,8 +849,8 @@ def example_simple_model():
     # 定义词典大小
     # V = 1000
     # 定义损失函数
-    criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0)
-    # 构建模型，src和tgt的词典大小都为V，N为encode和decode层数
+    criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
+    # 构建模型，src和tgt的词典大小都为V，N为encode和decode的层数
     model = make_model(V, V, n_layer).cuda()
 
     # 使用Adam优化器
@@ -871,19 +862,18 @@ def example_simple_model():
     lr_scheduler = LambdaLR(
         optimizer=optimizer,
         lr_lambda=lambda step: rate(
-            step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400 # warmup400次，即从第400次学习率开始下降
+            step, model_size=model.src_embed[0].d_model, factor=1.0, warmup=400 # wanrmup400次，即从第400次学习率开始下降
         ),
     )
     writer = SummaryWriter()    # tensorboard类实例化
     for epoch in range(EpochRange): # 运行几个epoch
         model.train() # 将模型调整为训练模式
-        Epoitem = epoch
+        # Epoitem = epoch
         # print(Epoitem)
-        
         run_epoch_train(  # 训练一个Batch
             data_gen(V, batch_size, train_batch), # 生成20个batch对象进行训练
             model.cuda(),
-            SimpleLossCompute(model.generator, criterion),
+            SimpleLossCompute(model.generator, criterion),  # 经过generator层、并计算损失函数
             optimizer,
             lr_scheduler,
             mode="train",
@@ -902,10 +892,6 @@ def example_simple_model():
         )[0].cuda() # run_epoch函数返回loss和train_state，这里只取loss，所以是[0]。但是源码中没有接收这个loss，所以[0]没有实际意义
     writer.close()
     
-    # for name, parms in model.named_parameters():
-	#     print('-->name:', name, '-->grad_requirs:', parms.requires_grad, '--weight', torch.mean(parms.data), ' -->grad_value:', torch.mean(parms.grad))
-     
-     
     # # 将模型调整为测试模式，准备开始copy任务
     # model.eval()
     # # 定义src为0-9，看看模型能否重新输出0-9
@@ -926,4 +912,4 @@ def example_simple_model():
 execute_example(example_simple_model)
 
 # 可视化结果
-# tensorboard --logdir=runs\Oct04_13-37-23_LAPTOP-UHS9699Q
+# tensorboard --logdir=runs\Sep27_10-30-38_LAPTOP-UHS9699Q
