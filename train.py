@@ -34,11 +34,11 @@ warnings.filterwarnings("ignore") # 设置忽略警告
 RUN_EXAMPLES = True
 
 
-batch_size = 256 # 即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
+batch_size = 100 # 即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
 
 V = 1000
 
-EpochRange = 500
+EpochRange = 20
 
 Epoch = 0
 Epoch_eval = 0
@@ -46,12 +46,12 @@ Epoch_eval = 0
 AccuracyNum = 0     
 AccuracyEval = 0
 
-train_batch = 20    # 训练多少个batch
-eval_batch = 5      # 验证多少个batch
+train_batch = 1000    # 训练多少个batch
+eval_batch = 500      # 验证多少个batch
 
 length = 3     # 每句话多少个单词
 
-n_layer = 6     # encoder和decoder的层数
+n_layer = 2     # encoder和decoder的层数
 
 reduced_dim = 256   # 线性层降低的维度
 
@@ -123,10 +123,10 @@ class EncoderDecoder(nn.Module):
         # return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
         x = self.encode(src, src_mask).cuda()
         
-        x = self.linear1(x) # 降维
-        x = self.sigmoid(x)
-        x = Quantization(x)
-        x = self.linear2(x)
+        # x = self.linear1(x) # 降维
+        # x = self.sigmoid(x)
+        # x = Quantization(x)
+        # x = self.linear2(x)
         
         return self.decode(x, src_mask, tgt, tgt_mask).cuda()
 
@@ -507,7 +507,6 @@ def run_epoch_train(
     train_state=TrainState(), # TrainState对象，用于保存一些训练状态
 ):
     """Train a single epoch"""
-    # print("epoch顺序",3)
     start = time.time()
     total_tokens = 0    # 记录tgt_y(去掉bos)的总token数，用于对total_loss进行正则化
     total_loss = 0     # 损失函数初始化
@@ -544,8 +543,8 @@ def run_epoch_train(
         # myloss = GetLoss(batch.src,d)
 
         prob = model.generator(out)     # 预测输出的概率分布，prob:[80, 2, 1000]
+        # print(prob)
         d, next_word = torch.max(prob, dim=2)   # d:概率最大的值；next_word:概率最大的值对应的下标, next_word:[80, 2]
-        # print(next_word)
         # 将输出的概率最大值的下标转换成样本值，g1_head和g2_head均为80个
         g1_head,  g2_head = case1_loss.value_to_g(case1_loss.index_to_value(next_word))
         # print("g1_head", g1_head, len(g1_head))
@@ -602,7 +601,7 @@ def run_epoch_train(
         global Epoch
         Epoch = Epoch + 1
         if(i == train_batch-1 and mode == 'train'):
-            # print("kkkk",next_word,d,batch.tgt_y)
+            # print("kkkk",next_word,d,batch.tgt_y,next_word.shape,batch.tgt_y.shape)
 
             AccuracyNum = 0
             PrecIndex = next_word.detach().cpu().numpy()  # 预测输出的值
@@ -612,7 +611,13 @@ def run_epoch_train(
                 for idx in range(length-1): # length = 10
                     if(PrecIndex[item][idx] == OriIndex[item][idx]):
                         AccuracyNum += 1 
-            # print("epoch", AccuracyNum / 720, AccuracyNum) 
+            # print("epoch", AccuracyNum / (batch_size*(length-1)), AccuracyNum) 
+            
+            line = "epoch: %d/%d, train_loss: %.4f, train_acc: %.4f \n" % (
+                Epoch / 20, EpochRange, loss / batch.ntokens, AccuracyNum / (batch_size*(length-1)))
+            with open('./outdata/train_result1.txt', 'a') as f:
+                f.write(line)
+            
                      
             writer.add_scalar(tag='Loss/train', scalar_value=loss_node, global_step=Epoch/train_batch)
             writer.add_scalar(tag='Accuracy/train', scalar_value=AccuracyNum/(batch_size*(length-1)), global_step=Epoch/train_batch)
@@ -649,6 +654,7 @@ def run_epoch_eval(
         # out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中
         #     batch.src, batch.tgt, batch.src_mask, batch.tgt_mask 
         # ).cuda()
+        
         out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中
             batch.src, batch.tgt_y, batch.src_mask, batch.tgt_mask 
         ).cuda()
@@ -731,9 +737,7 @@ class LabelSmoothing(nn.Module):
     def __init__(self, size, padding_idx, smoothing=0.0): 
         super(LabelSmoothing, self).__init__()
         # KL散度，又叫相对熵，用于衡量两个分布（离散分布和连续分布）之间的距离
-        self.criterion = nn.KLDivLoss(reduction="sum") 
-        # self.criterion = case1_loss.case1_loss1(g1, g2, g1_head, g2_head)
-    
+        # self.criterion = nn.KLDivLoss(reduction="sum") 
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
@@ -759,9 +763,7 @@ class LabelSmoothing(nn.Module):
         self.true_dist = true_dist # 保存平滑后的标签
         # 使用平滑后的标签计算损失，由于对`<blank>`部分进行了mask，所以在这部分不参与损失计算
         
-        # print(x, x.shape, target, target.shape)
-        # print(type(g1), type(g2), type(g1_head), type(g2_head))
-        # 计算case1损失函数，此处调用
+        
         loss1 = case1_loss.case1_loss1(g1, g2, g1_head, g2_head)
         # print(loss1, type(loss1))
         
@@ -810,7 +812,7 @@ class SimpleLossCompute:
         # x为调用generator输出的概率分布(EncoderDecoder的forward中并没有调用generator)
         x = self.generator(x) 
         # 使用KL散度计算损失，然后/norm对loss进行正则化，防止loss过大过小，取其平均数。
-        # print("qian",x.contiguous().view(-1, x.size(-1)))
+        # print("qian",x.shape,x.contiguous().view(-1, x.size(-1)).shape, y.shape,y.contiguous().view(-1).shape)
         sloss = (
             self.criterion(
                 # 概率分布(log之后为负值) x.shape:[160, 1000], 目标标签(正确答案的下标) y:[160]
