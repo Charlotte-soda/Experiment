@@ -1,5 +1,7 @@
+from audioop import mul
 import random
 import numpy as np
+from sklearn.utils import resample
 import torch
 from decimal import *
 
@@ -11,6 +13,7 @@ from decimal import *
 #     random.seed(seed)
 #     torch.backends.cudnn.deterministic = True
 
+# 量化+解量化
 # def Quantization(SigmoidData):
 #     # Quantization and De-quantization
 #     # N = 2
@@ -23,7 +26,7 @@ from decimal import *
 #     # return Migmoid_quant_rise_ind 
 #     return result
 
-# # 创建长度为1000的字典vocab
+# 创建长度为1000的字典vocab
 # def getData():
 #     # setup_seed(20)
 #     # samples = torch.distributions.exponential.Exponential(rate=1).sample([998])   # 共生成998个单词，还有2个是bos、eos
@@ -59,16 +62,31 @@ from decimal import *
 #     return sample    # len(vocab) = 1000，共有998个单词
 
 # data = getData()
-readvocab = torch.load('vocab_matrix')     # 读取vocab文件
+# readvocab = torch.load('vocab_matrix')     # 读取vocab文件
 # vocab = np.array(readvocab.values())
-vocab = torch.from_numpy(readvocab)
-# vocab = torch.tensor(vocab)
-# print(vocab, vocab.shape)
+
+# 创建包含1000个随机数的字典
+readvocab = np.random.exponential(scale=1.0, size=[1000])
+# vocab:torch.Size([1000]) vocab_multi:torch.Size([1000, 1000]) vocab_square:torch.Size([1000, 1000])
+vocab = torch.from_numpy(readvocab)     # 下标是[0,999]
+# g1*g2的单词表，注意reshape(1,-1)后是二维张量
+vocab_multi = torch.mm(vocab.reshape(1000, 1), vocab.reshape(1, 1000)).reshape(1,-1)
+# 0.5*g1^2*g2^2的单词表
+vocab_square = torch.mm(vocab.reshape(1000, 1)**2, vocab.reshape(1, 1000)**2).reshape(1,-1)/2
+# print(vocab)
+# 如果输入的index是[3,2]，则multi对应的index是[0,2*1000+2]
+# print(vocab[2],vocab[1],vocab_multi[0,2001],vocab_square[0,2001])
+
+# a = torch.range(1,4)
+# b = a
+# mm = torch.mm(a.reshape(4,1), b.reshape(1,4)).reshape(1,-1)
+# # print(a, b, mm)
+# print(a[2], b[1], mm[0,9])
 
 
-
-index1 = torch.tensor([[2, 3], [4, 5], [6, 7], [8, 9]])
-index2 = torch.tensor([[50, 3], [46, 5], [26, 7], [5, 34]])
+index1 = torch.tensor([[1, 2], [3, 4]])
+index2 = torch.tensor([[1, 2], [3, 4]])
+# print(torch.mm(index1.reshape(4, 1)**2, index2.reshape(1, 4)**2)/2)
 
 # value = []
 # g1 = [i[0] for i in value]  
@@ -116,17 +134,30 @@ def value_to_g(value):
     return g1, g2   # 二维tensor
 
 
-def case1_loss1(input1, input2, out1, out2):
-    # print("损失函数",input1,out1)
+def case1_loss1(g1, g2, g1_hat, g2_hat):
+    # print("损失函数",g1,g1_hat)
     eps = 1e-8 
-    loss1 = torch.sqrt(torch.pow((input1*input2 - out1*out2),2) + torch.pow((input1**2 * input2**2)/2 - (out1**2 * out2**2)/2, 2) + eps).cuda()
-    # loss1.requires_grad = True
-    # print(loss1, loss1.shape)  # loss1:[80]
+    loss1 = torch.sqrt(torch.pow((g1*g2 - g1_hat*g2_hat),2) + torch.pow((g1**2 * g2**2)/2 - (g1_hat**2 * g2_hat**2)/2, 2) + eps).cuda()
+
     loss1 = torch.sum(loss1).cuda()
-    # loss1.requires_grad = True
-    # print("和",loss1)
-    
+
     return loss1.cuda()
+
+# 面向目标
+def case1_loss2(g1, g2, g1_hat, g2_hat):
+    h1 = 2*g1*g2 - g1**2*g2**2/2
+    h2 = g1**2*g2**2 - g1*g2
+
+    loss2_1 = 3*(g1*g2 - g1**2*g2**2/2)**2
+    loss2_2 = (g1_hat*g2_hat - h1)**2
+    loss2_3 = (g1_hat**2*g2_hat**2/2 - h2)**2
+    loss2_4 = (g1_hat*g2_hat - g1_hat**2*g2_hat**2/2)**2
+
+    loss2 = (loss2_1 - loss2_2 - loss2_3 - loss2_4)**2
+
+    loss2 = torch.sum(loss2).cuda()
+
+    return loss2.cuda()
 
 # result = index_to_value(index1)
 # print(result, readvocab[2], readvocab[3])
@@ -143,4 +174,3 @@ def case1_loss1(input1, input2, out1, out2):
 # loss.requires_grad_(True)  #这里应该是因为如果将最后一层的模型参数梯度关闭，则计算出来的loss也没有梯度，不能追踪，所以要将loss的梯度设置为True
 # loss.backward()
 # print(loss, type(loss), loss.requires_grad)
-

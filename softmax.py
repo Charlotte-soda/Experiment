@@ -1,4 +1,6 @@
 import copy
+from csv import writer
+from glob import glob
 from locale import normalize
 import math
 import time
@@ -39,7 +41,7 @@ warnings.filterwarnings("ignore") # 设置忽略警告
 RUN_EXAMPLES = True
 
 
-batch_size = 128 # 即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
+batch_size = 64 # 即一次训练所抓取的数据样本数量； batch_size的大小影响训练速度和模型优化，也影响每一epoch训练模型次数。即有多少个句子。
 
 V = 1000
 
@@ -56,7 +58,7 @@ eval_batch = 500      # 验证多少个batch
 
 length = 3     # 每句话多少个单词
 
-n_layer = 2     # encoder和decoder的层数
+n_layer = 6     # encoder和decoder的层数
 
 reduced_dim = 256   # 线性层降低的维度
 
@@ -500,13 +502,14 @@ class TrainState:
     tokens: int = 0  # total # of tokens processed
     
 # 进行一个epoch训练
-def run_epoch_train(
+def run_epoch(
     data_iter,  # 可迭代对象，一次返回一个batch对象
     model,      # transformer模型，EncoderDecoder类对象
     loss_compute,   # SimpleLossCompute对象，用于计算损失
     optimizer,  # Adam优化器，验证时的optimizer是DummyOptimizer
     scheduler,  # LambdaLR对象，用于调整Adam的学习率，实现WarmUp。验证时的scheduler是DummyScheduler
-    writer,
+    epoch,
+    writer=writer,
     mode="train",
     accum_iter=1, # 多少个batch更新一次参数，默认为1，每个batch都对参数进行更新
     train_state=TrainState(), # TrainState对象，用于保存一些训练状态
@@ -551,20 +554,20 @@ def run_epoch_train(
         # print(prob)
         d, next_word = torch.max(prob, dim=2)   # d:概率最大的值；next_word:概率最大的值对应的下标, next_word:[80, 2]
         # 将输出的概率最大值的下标转换成样本值，g1_head和g2_head均为80个
-        g_hat = prob @ case1_loss.vocab.cuda()
+        g_hat = prob @ case1_loss.vocab.cuda()  # g_hat:[128, 2]
+
+        # print("g_hat", case1_loss.vocab.shape)
+        
         g1_hat = g_hat[:,0]
         g2_hat = g_hat[:,1]
-        # print(g_hat1.shape, g_hat2.shape)
-        # g1_head,  g2_head = case1_loss.value_to_g(case1_loss.index_to_value(next_word))
-        # print("g1_head", g1_head, len(g1_head))
-        # print("g2_head", g2_head, len(g2_head))
-        # print(batch.ntokens, batch.ntokens.shape) # batch.ntokens = batch_size * length
-        # 开始计算损失函数
-        # out:[80, 2, 512], batch.tgt_y:[80, 2]
         
-        global loss_node
-        loss,  loss_node= loss_compute(out, batch.tgt_y, batch.ntokens/2, g1, g2, g1_hat, g2_hat) #SimpleLloss_nodeossCompute经过generator层
+        # g1_hat_data = torch.trunc(g1_hat.data * 1000) / 1000  # 保留三位小数，用于计算准确度
+        # g2_hat_data = torch.trunc(g2_hat.data * 1000) / 1000  
+        
 
+        # out:[80, 2, 512], batch.tgt_y:[80, 2]     
+        global loss_node
+        loss,  loss_node = loss_compute(out, batch.tgt_y, batch.ntokens/(length-1), g1, g2, g1_hat, g2_hat) # SimpleLloss_nodeossCompute经过generator层
         
         # loss_node = loss_node / accum_iter
             
@@ -584,7 +587,14 @@ def run_epoch_train(
                 n_accum += 1    # 记录本次epoch的参数更新次数
                 train_state.accum_step += 1 # 记录模型的参数更新次数Epoch
             scheduler.step()    # 更新学习率
+            
+            # 训练集的loss，global_step：当前数据被加入的时候已经计算了多少个step
+            writer.add_scalar(tag='Loss/train', scalar_value=loss_node, global_step=epoch)
 
+        if mode == "eval":
+            # 验证集的loss
+            writer.add_scalar(tag='Loss/eval', scalar_value=loss_node, global_step=epoch)
+        
         total_loss += loss  # 累计loss，此处的loss是没有正则化的原loss
         total_tokens += batch.ntokens   # 累计处理过的tokens
         tokens += batch.ntokens # 累计从上次打印日志开始处理过的tokens
@@ -612,30 +622,59 @@ def run_epoch_train(
         
         # 加入决策函数之后计算accuracy
         # global Epoch
-        # Epoch = Epoch + 1
-        # if(i == train_batch - 1 and mode == 'train'):
-        #     AccuracyNum = 0
-        #     for j in range(train_batch - 1):
-        #         print(j)
-        #         if g1[j]*g2[j] == g1_hat[j]*g2_hat[j] or 0.5*pow(g1[j], 2)*pow(g2[j], 2) == 0.5*pow(g1_hat[j], 2)*pow(g2_hat[j], 2) or g1[j] == g2[j] or g1_hat[j] == g2_hat[j]:
-        #             AccuracyNum += 1 
-        #     print(AccuracyNum)    
-        #     line = "epoch: %d/%d, train_loss: %.4f, train_acc: %.4f \n" % (
-        #         Epoch / train_batch, EpochRange, loss_node, AccuracyNum / (batch_size*(length-1)))
-        #     with open('./outdata/train_result1.txt', 'a') as f:
-        #         f.write(line)         
-        # writer.add_scalar(tag='Loss/train', scalar_value=loss_node, global_step=Epoch/train_batch)
-        #     # writer.add_scalar(tag='Accuracy/train', scalar_value=AccuracyNum/(batch_size*(length-1)), global_step=Epoch/train_batch)  
+        # Epoch = Epoch + 1   # 记录目前训练到第几个batch
+ 
+
+        if mode == "train":
+            # AccuracyNum = (g1 == g1_hat_data).sum() + (g2 == g2_hat_data).sum() + (g1*g2 == g1_hat_data*g2_hat_data).sum() + (torch.pow(g1,2)*torch.pow(g2,2)/2 == torch.pow(g1_hat_data,2)*torch.pow(g2_hat_data,2)/2).sum()
+            acc11 = torch.trunc(g1 * g2 * 1000) / 1000
+            acc12 = torch.trunc(g1_hat * g2_hat * 1000) / 1000
+            acc21 = torch.trunc(torch.pow(g1,2)*torch.pow(g2,2)/2 * 1000) / 1000
+            acc22 = torch.trunc(torch.pow(g1_hat,2)*torch.pow(g2_hat,2)/2* 1000) / 1000
+
+            # if acc11 == acc12 or acc21 == acc22:    AccuracyNum = AccuracyNum + 1
+            # if acc11.equal(acc12) or acc21.equal(acc22): AccuracyNum = AccuracyNum + 1
+            # a = torch.ones([128])
+            # b = torch.ones([128])
+            # acc = (a == b).sum()
+            # print(acc)
+            AccuracyNum = (acc11 == acc12).sum() + (acc21 == acc22).sum()
+        
+            line = "epoch: %d/%d, train_loss: %.4f, train_acc: %.4f \n" % (
+                epoch, EpochRange, loss_node, AccuracyNum/batch_size)
+            with open('./Experiment-main/outdata/train_result1.txt', 'a') as f:
+                f.write(line)     
+
             
-        # start = time.time() # 重置开始时间
-        # tokens = 0  # 重置tokens数 
+            # scalar_value为y轴，global_step为x轴
+            if i == train_batch - 1:
+                writer.add_scalar(tag='Accuracy/train', scalar_value=AccuracyNum/batch_size,global_step=epoch)
+            
+        if mode == "eval":
+            acc11 = torch.trunc(g1 * g2 * 1000) / 1000
+            acc12 = torch.trunc(g1_hat * g2_hat * 1000) / 1000
+            acc21 = torch.trunc(torch.pow(g1,2)*torch.pow(g2,2)/2 * 1000) / 1000
+            acc22 = torch.trunc(torch.pow(g1_hat,2)*torch.pow(g2_hat,2)/2* 1000) / 1000
+
+            AccuracyNum = (acc11 == acc12).sum() + (acc21 == acc22).sum()
+
+            line = "epoch: %d/%d, train_loss: %.4f, train_acc: %.4f \n" % (
+                epoch, EpochRange, loss_node, AccuracyNum/batch_size)
+            with open('./Experiment-main/outdata/eval_result1.txt', 'a') as f:
+                f.write(line)     
+
+            if i == eval_batch - 1:
+                writer.add_scalar(tag='Accuracy/eval', scalar_value=AccuracyNum/batch_size, global_step=epoch)
+            
             
         # 使用sklearn计算准确率
-        accuracy = accuracy_score(batch.src[:, 1:].reshape(-1).cpu(), next_word.reshape(-1).cpu())
-        
-        
-        global Epoch
-        Epoch = Epoch + 1
+        # global Epoch
+        # Epoch = Epoch + 1
+        # accuracy = accuracy_score(batch.src[:, 1:].reshape(-1).cpu(), next_word.reshape(-1).cpu())
+ 
+        # copy任务计算准确率
+        # global Epoch
+        # Epoch = Epoch + 1
         # if(i == train_batch-1 and mode == 'train'):
         #     # print("kkkk",next_word,d,batch.tgt_y,next_word.shape,batch.tgt_y.shape)
         #     AccuracyNum = 0
@@ -647,123 +686,20 @@ def run_epoch_train(
         #             if(PrecIndex[item][idx] == OriIndex[item][idx]):
         #                 AccuracyNum += 1 
             # print("epoch", AccuracyNum / (batch_size*(length-1)), AccuracyNum) 
-            
-        line = "epoch: %d/%d, train_loss: %.4f, train_acc: %.4f \n" % (
-            Epoch / EpochRange, EpochRange, loss_node, accuracy)
-        with open('./outdata/train_result1.txt', 'a') as f:
-            f.write(line)
+        # line = "epoch: %d/%d, train_loss: %.4f, train_acc: %.4f \n" % (
+        #     Epoch / EpochRange, EpochRange, loss_node, accuracy)
+        # with open('./outdata/train_result1.txt', 'a') as f:
+        #     f.write(line)
             
         start = time.time() # 重置开始时间
         tokens = 0  # 重置tokens数
         
         del loss
-        # del loss_node
+        del loss_node
 
-    writer.add_scalar(tag='Loss/train', scalar_value=loss_node, global_step=Epoch/train_batch)
-    # writer.add_scalar(tag='Accuracy/train', scalar_value=accuracy_score/(batch_size*(length-1)), global_step=Epoch/train_batch)
-    writer.add_scalar(tag='Accuracy/train', scalar_value=accuracy, global_step=Epoch/train_batch)
-    
+   
     return total_loss / total_tokens.cuda(), train_state   # 返回正则化后的loss、训练状态
 
-# 进行一个epoch训练 (测试)
-def run_epoch_eval(
-    data_iter,  # 可迭代对象，一次返回一个batch对象
-    model,      # transformer模型，EncoderDecoder类对象
-    loss_compute,   # SimpleLossCompute对象，用于计算损失
-    optimizer,  # Adam优化器，验证时的optimizer是DummyOptimizer
-    scheduler,  # LambdaLR对象，用于调整Adam的学习率，实现WarmUp。验证时的scheduler是DummyScheduler
-    writer,
-    mode="eval",
-    accum_iter=1, # 多少个batch更新一次参数，默认为1，每个batch都对参数进行更新
-    train_state=TrainState(), # TrainState对象，用于保存一些训练状态
-):
-    
-    
-    """Train a single epoch"""
-    start = time.time()
-    total_tokens = 0    # 记录tgt_y(去掉bos)的总token数，用于对total_loss进行正则化
-    total_loss = 0     # 损失函数初始化
-    tokens = 0          # 记录target的总token数，每次打印日志后清零
-    n_accum = 0         # 本次epoch的参数更新次数
-    for i, batch in enumerate(data_iter):
-        # out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中
-        #     batch.src, batch.tgt, batch.src_mask, batch.tgt_mask 
-        # ).cuda()
-        
-        out = model.forward(    # out是decoder输出，generator的调用放在了loss_compute中
-            batch.src, batch.tgt_y, batch.src_mask, batch.tgt_mask 
-        ).cuda()
-        
-        # 将输入的索引转化为字典中的样本值
-        g1,  g2 = case1_loss.value_to_g(case1_loss.index_to_value(batch.src[:, 1:]))
-        """
-        计算损失，传入的三个参数分别为：
-        1. out: EncoderDecoder的输出，该值并没有过最后的线性层，该线性层被集成在了计算损失中
-        2. tgt_y: 要被预测的所有token，例如src为`<bos> I love you <eos>`，则`tgt_y`则为
-                  `我 爱 你 <eos>`
-        3. ntokens：这批batch中有效token的数量。用于对loss进行正则化。
-
-        返回两个loss，其中loss_node是正则化之后的，所以梯度下降时用这个。而loss是未进行正则化的，用于统计total_loss。
-        """
-        
-        prob = model.generator(out)     # 预测输出的概率分布
-        # print(prob.shape)
-        d, next_word = torch.max(prob, dim=2)   # d:概率最大的值；next_word:概率最大的值对应的下标
-        
-        # 将输出的概率最大值的下标转换成样本值，g1_head和g2_head均为80个
-        # g1_head,  g2_head = case1_loss.value_to_g(case1_loss.index_to_value(next_word))
-        g_hat = prob @ case1_loss.vocab.cuda()
-        g1_hat = g_hat[:,0]
-        g2_hat = g_hat[:,1]
-        
-        global loss_node
-        loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens, g1, g2, g1_hat, g2_hat)
-        
-        # loss_node = loss_node / accum_iter
-    
-        total_loss += loss  # 累计loss     
-        total_tokens += batch.ntokens   # 累计处理过的tokens
-        tokens += batch.ntokens # 累计从上次打印日志开始处理过的tokens
-
-        # 加入决策函数之后计算准确率
-        # global Epoch_eval
-        # Epoch_eval = Epoch_eval + 1
-        # if(i == eval_batch-1 and mode == 'eval'):
-        #     AccuracyEval = 0
-        #     for j in range(eval_batch - 1):
-        #         if g1[j]*g2[j] == g1_hat[j]*g2_hat[j] or 0.5*pow(g1[j], 2)*pow(g2[j], 2) == 0.5*pow(g1_hat[j], 2)*pow(g2_hat[j], 2):
-        #             AccuracyNum += 1 
-        # writer.add_scalar(tag='Loss/eval', scalar_value=loss_node, global_step=Epoch_eval/eval_batch)
-        #     writer.add_scalar(tag='Accuracy/eval', scalar_value=AccuracyEval/(batch_size*(length-1)), global_step=Epoch_eval/eval_batch)  
-                  
-        
-        # 计算准确率
-        global Epoch_eval
-        Epoch_eval = Epoch_eval + 1
-        # if(i == eval_batch-1 and mode == 'eval'):
-        #     global AccuracyEval
-        #     AccuracyEval = 0
-        #     PrecIndex = next_word.detach().cpu().numpy()  # 预测输出的值
-        #     OriIndex = batch.tgt_y.detach().cpu().numpy()  # 平滑后的标签
-        #     # print(next_word.shape, batch.tgt_y.shape)
-        #     for item in range(batch_size):
-        #         for idx in range(length-1):
-        #             if(PrecIndex[item][idx] == OriIndex[item][idx]):
-        #                 AccuracyEval += 1 
-            # print("测试epoch", AccuracyEval / 0.072, AccuracyEval) 
-        
-        # 使用sklearn计算准确率
-        accuracy = accuracy_score(batch.src[:, 1:].reshape(-1).cpu(), next_word.reshape(-1).cpu())
-        
-            
-        del loss
-        # del loss_node
-        
-    writer.add_scalar(tag='Loss/eval', scalar_value=loss_node, global_step=Epoch_eval/eval_batch)
-    # writer.add_scalar(tag='Accuracy/eval', scalar_value=AccuracyEval/(batch_size*(length-1)), global_step=Epoch_eval/eval_batch)
-    writer.add_scalar(tag='Accuracy/eval', scalar_value=accuracy, global_step=Epoch_eval/eval_batch)
-    
-    return total_loss / total_tokens.cuda(), train_state   # 返回正则化之后的total_loss，返回训练状态
 
 # 学习率调整函数
 def rate(step, model_size, factor, warmup):
@@ -820,14 +756,16 @@ class LabelSmoothing(nn.Module):
         # 使用平滑后的标签计算损失，由于对`<blank>`部分进行了mask，所以在这部分不参与损失计算
         
         
-        loss1 = case1_loss.case1_loss1(g1, g2, g1_hat, g2_hat)
+        loss1 = case1_loss.case1_loss1(g1, g2, g1_hat, g2_hat) # 面向决策
+        # loss2 = case1_loss.case1_loss2(g1, g2, g1_hat, g2_hat) # 面向目标
         # print(loss1, type(loss1))
         
         return loss1
+        # return loss2
         
         # 原loss是计算x和true_dist两个概率分布的距离的和
         # x.shape:[160, 1000],  true_dist.shape:[160, 1000],  注意此处的true_dist仍然是one-hot编码(因为smoothing=0.0)
-        return self.criterion(x, true_dist.clone().detach())    # 返回值只有一个值，因为reduction="sum"，概率分布的距离的和
+        # return self.criterion(x, true_dist.clone().detach())    # 返回值只有一个值，因为reduction="sum"，概率分布的距离的和
 
 # 造数据    
 def data_gen(V, batch_size, nbatches): 
@@ -933,33 +871,35 @@ def example_simple_model():
         ),
     )
     writer = SummaryWriter()    # tensorboard类实例化
+    global epoch
     for epoch in range(EpochRange): # 运行几个epoch
         model.train() # 将模型调整为训练模式
-        Epoitem = epoch
+        # Epoitem = epoch
         # print(Epoitem)
-        
-        run_epoch_train(  # 训练一个Batch
+        run_epoch(  # 训练一个Batch
             data_gen(V, batch_size, train_batch), # 生成20个batch对象进行训练
             model.cuda(),
             SimpleLossCompute(model.generator, criterion),
             optimizer,
             lr_scheduler,
-            mode="train",
-            writer=writer
+            epoch,
+            writer=writer,
+            mode="train"
         )
         # torch.cuda.empty_cache() # 清理缓存
         model.eval() # 进行一个epoch后进行模型验证
-        run_epoch_eval(
+        run_epoch(
             data_gen(V, batch_size, eval_batch), # 生成5个对象进行验证
             model.cuda(),
             SimpleLossCompute(model.generator, criterion),
             DummyOptimizer(), # 验证时不进行参数更新
             DummyScheduler(), # 验证时不调整学习率
+            epoch,
             mode="eval",
             writer=writer
         )[0].cuda() # run_epoch函数返回loss和train_state，这里只取loss，所以是[0]。但是源码中没有接收这个loss，所以[0]没有实际意义
     writer.close()
-    
+
     # for name, parms in model.named_parameters():
 	#     print('-->name:', name, '-->grad_requirs:', parms.requires_grad, '--weight', torch.mean(parms.data), ' -->grad_value:', torch.mean(parms.grad))
      
@@ -982,6 +922,7 @@ def example_simple_model():
     
 
 execute_example(example_simple_model)
+                 
 
 # 可视化结果
 # tensorboard --logdir=runs\Oct04_13-37-23_LAPTOP-UHS9699Q

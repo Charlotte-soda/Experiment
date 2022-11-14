@@ -783,6 +783,7 @@ def data_gen(V, batch_size, nbatches):
     return: yield一个Batch对象
     """
     for i in range(nbatches): # 遍历batch，生成nbatch个batch
+        # data:[1, V)
         data = torch.randint(1, V, size=(batch_size, length)) # batch_size句话，每句话长度位length
         # print(data)
         data[:, 0] = 1 # 将每行的第一个词改为1，即"<bos>"
